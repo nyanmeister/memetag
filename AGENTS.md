@@ -42,6 +42,25 @@ Tags and embedded OCR belong to the media; the index and thumbnails are caches.
 Vectors and proposal decisions are index-only. Use SQLite's backup API or `.backup`
 for a live index rather than copying a database while WAL writes are active.
 
+## Phone webapp handling
+
+- `src/serve.rs` renders the page; `src/web_actions.js` handles Copy, Share and Open.
+  Modern clipboard writes start during the tap with a promised PNG. Share needs
+  a fresh user activation after a slow download; retain the prepared file and offer
+  a finish button. Older ClipboardItem implementations use the same fallback.
+- Retry only read-only downloads, with bounded timeouts and complete-file checks.
+  Never automatically retry clipboard writes, share sheets or `/share` commands.
+  Cancelling a pending download must prevent a later copy. Do not report a native
+  browser failure just because its permission dialog takes more than four seconds.
+- Originals from configured network sources use `batch::read_for_view` over SSH,
+  including legacy pull-only settings; avoid probing a stalled mount first.
+  Editing keeps its matching-writer checks. Thumbnails remain local caches.
+- `node tools/check-web.mjs` runs isolated headless Chromium checks with latency,
+  dropped/stalled transfers and real user-activation expiry. It needs Node with
+  built-in WebSocket and Chromium (`MEMETAG_TEST_BROWSER` selects its executable).
+  Android clipboard/share handoffs are stubbed there; also test on the phone.
+  `tests/serve_cli.rs` exercises real HTTP and fake SSH against disposable media.
+
 ## OCR handling
 
 `src/ocr.rs` runs inference and tracks completion; `embed.rs` writes saved results;

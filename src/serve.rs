@@ -331,17 +331,16 @@ fn handle(s: &Arc<Shared>, mut stream: TcpStream) -> Result<(), String> {
             let Some(row) = find(s, &f)? else {
                 return not_found(&mut stream);
             };
-            let p = s.c.file_path(&row.path)?;
-            if let Err(e) = reachable(s, &p) {
-                return respond(
+            match original_bytes(s, &row) {
+                Ok(bytes) => respond(
                     &mut stream,
-                    404,
-                    "text/plain; charset=utf-8",
-                    e.as_bytes(),
-                    &[],
-                );
+                    200,
+                    mime(&row.format),
+                    &bytes,
+                    &[("Cache-Control", "no-cache")],
+                ),
+                Err(e) => unavailable(&mut stream, &e),
             }
-            send_file(&mut stream, &p, mime(&row.format), "no-cache")
         }
         "/png" => {
             let Some(row) = find(s, &f)? else {
@@ -355,13 +354,7 @@ fn handle(s: &Arc<Shared>, mut stream: TcpStream) -> Result<(), String> {
                     &bytes,
                     &[("Cache-Control", "no-cache")],
                 ),
-                Err(e) => respond(
-                    &mut stream,
-                    404,
-                    "text/plain; charset=utf-8",
-                    e.as_bytes(),
-                    &[],
-                ),
+                Err(e) => unavailable(&mut stream, &e),
             }
         }
         "/suggest" => {
@@ -472,13 +465,11 @@ fn icon_png(size: u32) -> Vec<u8> {
 /// anything else decoded (an animation's first frame) and encoded, longest side capped at 2048 px; a video or an
 /// undecodable file falls back to its cached thumbnail.
 fn png_of(s: &Shared, r: &FileRow) -> Result<Vec<u8>, String> {
-    let p = s.c.file_path(&r.path)?;
-    if r.format == "png" {
-        if reachable(s, &p).is_ok() {
-            return std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()));
-        }
-    }
-    let decoded = reachable(s, &p).ok().and_then(|_| image::open(&p).ok());
+    let decoded = match original_bytes(s, r) {
+        Ok(bytes) if r.format == "png" => return Ok(bytes),
+        Ok(bytes) => image::load_from_memory(&bytes).ok(),
+        Err(_) => None,
+    };
     let img = match decoded {
         Some(i) => i,
         None => {
@@ -495,6 +486,14 @@ fn png_of(s: &Shared, r: &FileRow) -> Result<Vec<u8>, String> {
     img.write_to(&mut out, image::ImageFormat::Png)
         .map_err(|e| format!("{}: png encode: {e}", r.path))?;
     Ok(out.into_inner())
+}
+
+/// Use the authoritative SSH reader for configured network sources, avoiding a
+/// disconnected or stale FUSE mount. It rejects incomplete transfers. Local
+/// collections still read their local files; thumbnails remain in the cache.
+fn original_bytes(s: &Shared, r: &FileRow) -> Result<Vec<u8>, String> {
+    let p = s.c.file_path(&r.path)?;
+    crate::batch::read_for_view(&s.c, &p)
 }
 
 fn find(s: &Shared, key: &str) -> Result<Option<FileRow>, String> {
@@ -640,7 +639,7 @@ fn render(s: &Shared, q: &str, page: usize, msg: Option<&str>) -> Result<String,
     h.push_str(".n{padding:0 10px 6px;opacity:.7;font-size:13px}.g{display:flex;flex-wrap:wrap;gap:4px;padding:4px}.t{position:relative;height:");
     h.push_str(&TILE_H.to_string());
     h.push_str("px;background:#000 center/cover no-repeat;border-radius:4px;flex-grow:1}.t a.s{position:absolute;inset:0}.t a.o,.t a.sh{position:absolute;bottom:2px;padding:3px 7px;font-size:13px;background:#000a;color:#fff;border-radius:4px;text-decoration:none}.t a.o{right:2px}.t a.sh{left:2px}");
-    h.push_str(".p{display:flex;justify-content:space-between;padding:12px}.p a{color:inherit}.m{padding:6px 10px;background:#2a5;color:#fff}#toast{position:fixed;left:8px;right:8px;bottom:12px;border-radius:6px;text-align:center}[hidden]{display:none}#sug{display:flex;flex-direction:column;gap:3px;padding:0 8px 6px}#sug button{text-align:left;padding:9px 10px;border-radius:6px;border:1px solid #555;background:inherit;color:inherit;font:inherit}#sug small{opacity:.6;float:right}");
+    h.push_str(".p{display:flex;justify-content:space-between;padding:12px}.p a{color:inherit}.m{padding:6px 10px;background:#2a5;color:#fff}#toast,#transfer{position:fixed;left:8px;right:8px;bottom:12px;border-radius:6px;z-index:3}#toast{text-align:center}#transfer span{display:block}#transfer button{margin:4px 4px 0 0}[hidden]{display:none}#sug{display:flex;flex-direction:column;gap:3px;padding:0 8px 6px}#sug button{text-align:left;padding:9px 10px;border-radius:6px;border:1px solid #555;background:inherit;color:inherit;font:inherit}#sug small{opacity:.6;float:right}");
     h.push_str("</style></head><body>");
     h.push_str("<form action=\"/\"><input type=search name=q placeholder=\"tags, t:text, format:gif …\" value=\"");
     h.push_str(&qe);
@@ -692,26 +691,12 @@ fn render(s: &Shared, q: &str, page: usize, msg: Option<&str>) -> Result<String,
 /// browser puts an image on the Android clipboard only from a page's call to the async Clipboard API (PNG
 /// only, user gesture, secure context — localhost counts), and the share sheet can only be opened by the app
 /// in front, which is the browser, through the Web Share API (`navigator.share` with files; Chromium on
-/// Android, not Firefox). Each fetches first and calls the API with the result: Chromium 93's ClipboardItem
-/// refuses a Promise value, and both calls still fall inside the click's activation window on localhost (a
-/// long fetch, a big video over cellular, can outlive it and the browser then answers "not allowed").
+/// Android, not Firefox). Modern ClipboardItem accepts a promise, so copying starts during the tap and
+/// waits for a complete download. Older browsers use a prepared-file button after activation expires;
+/// sharing uses that same button when necessary. Retry only downloads, never native browser actions.
 /// Share without `navigator.share` follows its link to the server's `/share` (desktop clip); with it but a
 /// refused file (`canShare` false: a type Chromium does not share, e.g. 7z) it says so instead.
-const TILE_SCRIPT: &str = r#"<script>
-document.addEventListener('click',function(e){var a=e.target.closest('a.s,a.sh');if(!a)return;
-var t=document.getElementById('toast');function say(m){t.textContent=m;t.hidden=false;clearTimeout(t._h);t._h=setTimeout(function(){t.hidden=true},5000);fetch('/log?m='+encodeURIComponent(m))}
-function body(r){if(!r.ok)return r.text().then(function(m){throw new Error(m)});return r.blob()}
-function timed(p){var late=new Promise(function(_,rej){setTimeout(function(){rej(new Error('no answer from the browser after 4 s'))},4000)});return Promise.race([p,late])}
-if(a.classList.contains('s')){e.preventDefault();
-if(!navigator.clipboard||!navigator.clipboard.write||!window.ClipboardItem){say('this browser cannot copy images; Share sends it instead');return}
-fetch('/png?f='+a.dataset.f).then(body).then(function(blob){return timed(navigator.clipboard.write([new ClipboardItem({'image/png':blob})]))})
-.then(function(){say(a.dataset.anim?'copied the first frame as PNG; Share sends the animation':'copied')},function(x){say('copy failed: '+x.message)});return}
-if(!navigator.share||!navigator.canShare)return;e.preventDefault();
-fetch('/file?f='+a.dataset.f).then(body).then(function(blob){var f=new File([blob],a.dataset.n,{type:blob.type});
-if(!navigator.canShare({files:[f]})){say('this browser cannot share a '+(blob.type||'file of this type'));return}
-return navigator.share({files:[f]}).then(function(){say('shared '+a.dataset.n)})}).catch(function(x){if(x.name!=='AbortError')say('share failed: '+x.message)});
-});
-</script>"#;
+const TILE_SCRIPT: &str = concat!("<script>\n", include_str!("web_actions.js"), "</script>");
 
 /// Tag suggestions while typing: `/suggest` answers for the tag under the caret, with the whole query each
 /// completion would produce, so a tap sets the field and runs the search (one tap = results on a phone; another
@@ -777,6 +762,7 @@ fn respond(
         303 => "See Other",
         400 => "Bad Request",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     let mut head = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
@@ -792,6 +778,16 @@ fn respond(
 
 fn not_found(stream: &mut TcpStream) -> Result<(), String> {
     respond(stream, 404, "text/plain; charset=utf-8", b"not found", &[])
+}
+
+fn unavailable(stream: &mut TcpStream, message: &str) -> Result<(), String> {
+    respond(
+        stream,
+        503,
+        "text/plain; charset=utf-8",
+        message.as_bytes(),
+        &[("Cache-Control", "no-store"), ("Retry-After", "2")],
+    )
 }
 
 fn send_file(stream: &mut TcpStream, p: &Path, ctype: &str, cache: &str) -> Result<(), String> {

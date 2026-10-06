@@ -197,6 +197,10 @@ struct Remote {
     command: String,
 }
 fn remote(c: &Cfg) -> Result<Option<Remote>, String> {
+    configured_remote(c, false)
+}
+
+fn configured_remote(c: &Cfg, viewing: bool) -> Result<Option<Remote>, String> {
     if let Some(library) = c.library()? {
         let source = library.source(c.active_source.as_deref().unwrap_or("main"))?;
         if let Some(remote) = &source.remote {
@@ -213,7 +217,12 @@ fn remote(c: &Cfg) -> Result<Option<Remote>, String> {
         let table: toml::Table = text
             .parse()
             .map_err(|e| format!("Batch configuration: {e}"))?;
-        if let Some(value) = table.get("batch_remote") {
+        let sections: &[&str] = if viewing {
+            &["pull_remote", "batch_remote"]
+        } else {
+            &["batch_remote"]
+        };
+        for value in sections.iter().filter_map(|section| table.get(*section)) {
             let r: Remote = value
                 .clone()
                 .try_into()
@@ -294,6 +303,24 @@ pub fn read_for_edit(c: &Cfg, path: &std::path::Path) -> Result<Vec<u8>, String>
     match remote(&c)? {
         Some(remote) => read_server_file(&remote, path, std::path::Path::new("ssh")),
         None => std::fs::read(path).map_err(|e| format!("{}: {e}", path.display())),
+    }
+}
+
+/// Read-only viewing uses the source's server (or a legacy pull-only server),
+/// without checking an offline mount's inode first. Editing retains its stricter
+/// matching writer configuration and source-identity checks above.
+pub(crate) fn read_for_view(c: &Cfg, path: &std::path::Path) -> Result<Vec<u8>, String> {
+    c.ensure_current()?;
+    let scoped = if let Some(library) = c.library()? {
+        let key = library.key(path)?;
+        let (source, _) = library.identify(&key)?;
+        c.for_source(&source.id)?
+    } else {
+        c.clone()
+    };
+    match configured_remote(&scoped, true)? {
+        Some(remote) => read_server_file(&remote, path, std::path::Path::new("ssh")),
+        None => read_for_edit(c, path),
     }
 }
 

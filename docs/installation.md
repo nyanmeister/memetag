@@ -195,7 +195,9 @@ updating the implementation. Never remove write journals as part of an upgrade.
 ## Phone (Termux)
 
 The CLI and browser grid run in Termux on Android. The desktop GUI is not required;
-original-file access still needs a local or mounted collection.
+original-file access needs local files or a configured SSH source. For mobile data,
+use an SSH host alias reachable outside your LAN, with its port and trusted host key
+configured in Termux. A LAN-only server address will not work without a route to it.
 
 - `pkg install rust clang git`, clone, `cargo build --release -p memetag`, symlink the binary into `$PREFIX/bin`. No source change is needed.
 - The collection is the server's, mounted with sshfs inside Termux (a FUSE mount there
@@ -226,6 +228,22 @@ original-file access still needs a local or mounted collection.
   Web Share API with the file, which Firefox for Android does not support for files. Measured
   2026-10-04 with Iceraven 2.48, Jelly on WebView 93, and Cromite 153 (works).
   Chromium's "Install and create shortcut" menu item uses the page's manifest for a home-screen icon.
+- **Unreliable connections:** Copy starts its clipboard operation during your tap
+  and waits for the complete download. Share may show **Share now** when a slow
+  transfer finishes; tap it to open the share sheet without downloading again.
+  Older browsers can similarly show **Copy now**. Transfer controls show progress,
+  let you cancel, retry temporary connection failures up to twice, and offer
+  **Retry** if the file stays unavailable. Open also waits for a complete original.
+  Configured SSH sources fetch originals directly from their server, so viewing
+  does not depend on a healthy phone-side network mount. Cached thumbnails still
+  work without that connection; unavailable originals still need the server.
+- **Clipboard permissions:** memetag writes images but never reads your clipboard.
+  A delayed clipboard call can cause a permission prompt after the tap expires;
+  the immediate Copy operation avoids that in current Chromium browsers. If the
+  browser does ask, its site permission controls the grant; the webapp cannot make
+  it permanent itself. Use the same origin as your shortcut: `localhost:7777` and
+  `127.0.0.1:7777` have separate site settings. A clipboard grant does not replace
+  the fresh tap required to open a share sheet.
 - **Why Share is the browser's call and not `termux-share`:** Android 10+ aborts an activity
   started by an app that is not in front ("Abort background activity starts" in logcat), and a
   share sheet opened by the server process is exactly that while the browser is in front. It only
