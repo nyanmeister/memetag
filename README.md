@@ -60,7 +60,7 @@ The browser copies and closes itself on left-click, copies and stays open on mid
 ### Search by tag:
 <img width="1092" height="752" alt="Example usage with the hand-made tag 'amogus'." src="https://github.com/user-attachments/assets/79bf6d67-9a60-4a1d-be7b-477e87201c0b" />
 
-### OCR:
+### OCR (search by visible text):
 <img width="1092" height="752" alt="Example usage of searching the text 'always has been'." src="https://github.com/user-attachments/assets/45582940-9517-4c22-884d-6585d0362a6c" />
 
 
