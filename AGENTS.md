@@ -42,6 +42,30 @@ Tags and embedded OCR belong to the media; the index and thumbnails are caches.
 Vectors and proposal decisions are index-only. Use SQLite's backup API or `.backup`
 for a live index rather than copying a database while WAL writes are active.
 
+## OCR handling
+
+`src/ocr.rs` runs inference and tracks completion; `embed.rs` writes saved results;
+`editor.rs` and `index.rs` handle reviewed text and search precedence.
+
+- `memetag ocr` normally stores machine text in SQLite, not in the files.
+  `ocr --embed` embeds newly inferred results. `embed-text` embeds existing nonempty
+  results without inference; use `--dry-run` first. For bulk network embedding,
+  transfer a coherent index backup and run on the file server (see the command reference).
+- Human-reviewed `meme:text` with `meme:textSource=manual` wins over machine text,
+  **including deliberately empty text**. Keep `manual_text` separate from machine
+  results so a late OCR worker cannot overwrite a review. Respect this marker in
+  inference, embedding and reindexing; empty reviewed text is not missing OCR.
+- A tag-only save must not replace newer indexed machine text with an older caption
+  embedded in the file. Preserve completion metadata and the editor's precedence.
+- Completion is keyed by `tesseract` or `ollama:<model>` in `text_meta`. Changing the
+  model triggers new work; changing only the prompt does not. Use `ocr --all` for
+  an intentional rerun; human reviews remain protected. Keep engine/model/prompt
+  and the Ollama URL configurable rather than assuming a particular machine.
+- Each image commits separately; stopping finishes the image in flight and a rerun
+  resumes. Preserve pull/OCR coordination. Test changes on disposable media with
+  mocked engines, including empty reviews, late results and failed embedding retries;
+  see editor tests and `tests/embed_cli.rs`.
+
 ## XMP namespace
 
 memetag's own properties (`meme:id`, `meme:origMtime`, `meme:text`) are written under
