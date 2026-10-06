@@ -6,13 +6,41 @@ memetag is a Rust workspace: `memetag` (CLI, workers), `memetag-gui` (egui brows
 ```sh
 cargo build --locked --release -p memetag -p memetag-gui
 cargo test --locked -p memetag --features gui
-cargo fmt
+cargo fmt --all --check
 ```
+
+The default desktop build excludes image inference. Build `--workspace` only when
+the inference helper is needed; its ONNX Runtime setup may download binaries.
+Keep Cargo.lock pinned. Run `cargo fmt --all` after editing Rust, and use
+`cargo clippy --locked --workspace --all-targets` when checking the full workspace.
 
 Every executable answers `--version` without configuration, a display or models.
 Run checks against a disposable collection under temporary XDG directories; never
 against a live collection or through a network mount. `tools/check-gui.sh` opens a
 private Xvfb display for GUI checks and must not send input to a real desktop.
+
+## Code map and data invariants
+
+- `src/lib.rs`: configuration and CLI/GUI entry points; `gui/` enables the desktop
+  feature, while `infer/` owns ONNX model loading and embedding generation.
+- `src/xmp.rs`, `containers.rs`, `matroska.rs`: metadata merging and container
+  handling. Preserve foreign properties and media payloads, including animation.
+- `src/writer.rs`, `locking.rs`: verified in-place writes, interrupted-write
+  journals and advisory locks. Preserve inode and timestamps; never remove journals
+  during an upgrade or roll back a newer completed edit with an old journal.
+- `src/sources.rs`, `library.rs`, `index.rs`: source identity, selected folders and
+  SQLite caches. Index paths use `SOURCE_ID/relative/path`; keep IDs stable when
+  renaming or relocating sources. Disabled/offline sources retain cached data.
+- `src/batch.rs`, `pull.rs`, `vocabsync.rs`: server workers and synchronization.
+  Scan/write network collections on their configured file server; do not bypass
+  mount checks. Reject stale edits and stale vocabulary saves. Content IDs exclude
+  XMP: use SHA-256 of the complete file for edit revisions, never a content ID.
+- `src/grid.rs`, `editor.rs`, `library_ui.rs`: desktop views; `serve.rs`: the phone
+  browser grid. Keep blocking filesystem/network work off desktop UI threads.
+
+Tags and embedded OCR belong to the media; the index and thumbnails are caches.
+Vectors and proposal decisions are index-only. Use SQLite's backup API or `.backup`
+for a live index rather than copying a database while WAL writes are active.
 
 ## XMP namespace
 
@@ -36,7 +64,37 @@ legacy_xmp_namespaces = ["https://old.example/ns/meme/1.0/"]
 these for one process. All programs that write a collection, including file-server
 workers, need the same settings; `memetag doctor` prints the ones in effect.
 
+Coordinate namespace settings across all writers before changing them. Clients
+without a matching write or legacy namespace treat those properties as foreign.
+`tests/xmp_namespace_cli.rs` exercises configuration precedence and migration;
+run it when changing initialization or namespace handling.
+
+## Checks and publication
+
+Integration tests in `tests/` cover CLI writes, source migration, remote mappings,
+namespace migration and bounded mutation fuzzing. Longer fuzz campaigns belong on
+scratch copies with an external timeout; see docs/legacy-workflow.md. Clear inherited
+MEMETAG_* overrides when setting up isolated tests so they cannot select real data.
+
+Keep runtime configuration, credentials, media, models, build output and private
+maintenance notes outside version control. Use fictional paths/hosts in examples.
+Check every ref and historical object being published, not just the current tree;
+never import private history into a cleaned public repository.
+
+`tools/package.sh` stages native archives and checks executable versions, runtime
+libraries and dependency notices. The CI workflow uploads build artifacts, not a
+GitHub release. Neither packaging nor publication authorizes installation, service
+activation or collection migration. Preserve upstream license notices.
+
 ## Documents
 
-README.md for use, docs/installation.md for setup, docs/concurrency.md for the write
-and sync rules, docs/releasing.md and PORTABILITY.md before a release.
+- [README.md](README.md): feature overview and quick start.
+- [docs/installation.md](docs/installation.md): dependencies, components, sources,
+  optional programs and phone setup.
+- [docs/legacy-workflow.md](docs/legacy-workflow.md): detailed command/search/OCR
+  reference despite its historical filename.
+- [docs/concurrency.md](docs/concurrency.md): write/sync guarantees and upgrade order.
+- [docs/network-sources.md](docs/network-sources.md): supported SSH sources and backend
+  extension boundaries.
+- [docs/releasing.md](docs/releasing.md) and [PORTABILITY.md](PORTABILITY.md): privacy,
+  source history, packaging, licenses and platform constraints.
