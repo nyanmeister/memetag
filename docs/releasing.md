@@ -25,6 +25,49 @@ server configuration. Never change the default: existing metadata must remain re
 A collection written under another namespace is handled by `legacy_xmp_namespaces`, not
 by editing the constant.
 
+## Keeping private and public source in step
+
+Keep the same features, dependencies, tests and generic configuration examples in
+both trees. Machine-specific configuration and maintenance notes belong outside
+the source tree. Private history stays private; different commit IDs are expected.
+Do not add a private remote to the public checkout, fetch private objects into it,
+or merge/cherry-pick private history for convenience.
+
+Before an update:
+
+1. Check both working trees for tracked changes and untracked source files. Fetch
+   the public checkout's public remote and inspect new commits before integrating
+   them; changes made directly on GitHub need to reach the private source too.
+2. Review the changed files for private information, then transfer the reviewed
+   content, including additions, removals and executable permissions. Commit each
+   history separately. Do not copy whole working directories containing `.git`,
+   local settings, caches, models or build output.
+3. Compare the complete committed trees, not just `src/` or version numbers:
+
+   ```sh
+   git -C /path/to/private-checkout rev-parse 'HEAD^{tree}'
+   git -C /path/to/public-checkout rev-parse 'HEAD^{tree}'
+   ```
+
+   With the same Git object format, matching tree IDs prove that all tracked
+   paths, file contents and modes match, including Cargo.lock, tests, packaging,
+   service units and documentation. This comparison does not import any history.
+   If IDs differ, compare `git ls-tree -r HEAD` manifests and review each differing
+   file; record any intentional difference rather than silently ignoring it.
+4. Run checks appropriate to code changes on the reviewed source with identical
+   feature selections and isolated test configuration. Documentation-only changes
+   need link and whitespace checks. Equal source trees establish source parity;
+   they do not establish that installed binaries or runtime configurations match.
+5. Push the intended branches, then verify both remote heads and tree IDs. A
+   rejected push requires inspecting and incorporating the newer remote work;
+   do not force-push over it. Record the paired commit IDs, common tree ID,
+   checks and deployment status in private maintenance notes.
+
+Build revision strings will differ between the two histories even when their
+source trees match. Keep collection namespace settings coordinated as described
+in [AGENTS.md](../AGENTS.md#xmp-namespace); source synchronization alone does not
+update existing installations or migrate their media.
+
 ## Native archives
 
 Build/test the exact clean revision. Check each executable's `--version`, test a

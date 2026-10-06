@@ -105,6 +105,13 @@ maintenance notes outside version control. Use fictional paths/hosts in examples
 Check every ref and historical object being published, not just the current tree;
 never import private history into a cleaned public repository.
 
+Keep private and public tracked source trees in step, including tests, dependencies,
+examples and packaging. Fetch public updates before publishing, preserve direct
+GitHub edits, and compare complete tree IDs after separately committing reviewed
+content. Record the paired heads and any intentional differences privately; see
+[docs/releasing.md](docs/releasing.md#keeping-private-and-public-source-in-step).
+Source parity does not imply matching installed binaries or runtime configuration.
+
 `tools/package.sh` stages native archives and checks executable versions, runtime
 libraries and dependency notices. The CI workflow uploads build artifacts, not a
 GitHub release. Neither packaging nor publication authorizes installation, service
