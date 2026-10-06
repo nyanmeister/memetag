@@ -10,6 +10,7 @@
 //! For file safety this must not run while an OCR pass is writing the index —
 //! `memetag-ocr.service` active refuses the pull unless `--force`.
 use crate::index::{Db, FileRow, Scan};
+use crate::remote::{configured as remote, Purpose};
 use crate::vocab::Vocab;
 use crate::vocabsync::Canonical; // `store.name()` in vocab_step is a trait method
 use crate::Cfg;
@@ -164,56 +165,10 @@ pub fn worker() -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Deserialize, Clone)]
-struct Remote {
-    local_root: PathBuf,
-    root: PathBuf,
-    host: String,
-    command: String,
-}
-/// `[pull_remote]` in config.toml, honoured when its `local_root` is the configured root (same shape as `[batch_remote]`).
-fn remote(c: &Cfg) -> Result<Option<Remote>, String> {
-    if let Some(library) = c.library()? {
-        let source = library.source(c.active_source.as_deref().unwrap_or("main"))?;
-        if let Some(remote) = &source.remote {
-            return Ok(Some(Remote {
-                local_root: source.path.clone(),
-                root: remote.root.clone(),
-                host: remote.host.clone(),
-                command: remote.pull_command.clone(),
-            }));
-        }
-    }
-    if let Ok(text) = std::fs::read_to_string(crate::paths::config_dir().join("config.toml")) {
-        let table: toml::Table = text
-            .parse()
-            .map_err(|e| format!("Pull configuration: {e}"))?;
-        if let Some(value) = table.get("pull_remote") {
-            let r: Remote = value
-                .clone()
-                .try_into()
-                .map_err(|e| format!("Pull configuration: {e}"))?;
-            if c.root == r.local_root {
-                if r.host.is_empty()
-                    || r.host.starts_with('-')
-                    || r.host.chars().any(char::is_whitespace)
-                {
-                    return Err("Invalid pull server host".into());
-                }
-                return Ok(Some(r));
-            }
-        }
-    }
-    if crate::batch::requires_remote(&c.root)? {
-        return Err("Pulling this share needs a matching [pull_remote] configuration — never walk the mount".into());
-    }
-    Ok(None)
-}
-
 /// The `[pull_remote]` host, for the vocab sync's own side-channel ssh (a plain `ssh host cat`, not the worker
 /// protocol). `None` when the root is local and no server is configured — then there is nothing to sync against.
 pub fn remote_host(c: &Cfg) -> Result<Option<String>, String> {
-    Ok(remote(c)?.map(|r| r.host))
+    Ok(remote(c, Purpose::Pull)?.map(|r| r.host))
 }
 
 /// Where listings and scans come from: the configured server worker over one ssh session, or this process.
@@ -240,7 +195,7 @@ struct Source {
 }
 impl Source {
     fn open(c: &Cfg, connect_timeout_secs: u32) -> Result<Source, String> {
-        let Some(r) = remote(c)? else {
+        let Some(r) = remote(c, Purpose::Pull)? else {
             return Ok(Source {
                 root: c.root.clone(),
                 host: None,
@@ -249,20 +204,7 @@ impl Source {
                 output: None,
             });
         };
-        let connect = format!("ConnectTimeout={connect_timeout_secs}");
-        let mut child = Command::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                &connect,
-                "-o",
-                "ServerAliveInterval=10",
-                "-o",
-                "ServerAliveCountMax=3",
-                &r.host,
-                &r.command,
-            ])
+        let mut child = crate::remote::ssh("ssh", &r.host, &r.command, connect_timeout_secs)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -616,7 +558,7 @@ fn sync(
         // the vocab ssh runs first; if it could not reach the host, the worker's ssh to the same host would only time
         // out again, so stop here with one clear message instead of a second wait (2026-09-26)
         if step.unreachable {
-            let host = remote(c)?
+            let host = remote(c, Purpose::Pull)?
                 .map(|r| r.host)
                 .unwrap_or_else(|| "the server".into());
             return Err(unreachable_msg(&host, "pull"));

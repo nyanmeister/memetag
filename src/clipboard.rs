@@ -87,23 +87,7 @@ pub fn read_image() -> Result<Vec<u8>, String> {
 /// the owner has no such target, or it does not answer within a second.
 fn read_target(selection: &str, target: &str) -> Result<Vec<u8>, String> {
     let e = |e: &dyn std::fmt::Display| e.to_string();
-    let (conn, screen_num) = x11rb::connect(None).map_err(|x| e(&x))?;
-    let screen = &conn.setup().roots[screen_num];
-    let win = conn.generate_id().map_err(|x| e(&x))?;
-    conn.create_window(
-        x11rb::COPY_DEPTH_FROM_PARENT,
-        win,
-        screen.root,
-        0,
-        0,
-        1,
-        1,
-        0,
-        WindowClass::INPUT_OUTPUT,
-        screen.root_visual,
-        &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-    )
-    .map_err(|x| e(&x))?;
+    let (conn, win) = selection_window().map_err(|x| e(&x))?;
     let atom = |name: &str| {
         conn.intern_atom(false, name.as_bytes())
             .map_err(|x| e(&x))?
@@ -216,23 +200,34 @@ pub fn serve(selection: &str) -> Result<(), String> {
     r.map_err(|e| e.to_string())
 }
 
-fn run(entries: Vec<Entry>, selection: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// A 1×1 window that is never mapped, to own a selection or ask for one with; it listens for property changes
+/// because the server timestamp and INCR chunks both arrive as PropertyNotify on it.
+fn selection_window(
+) -> Result<(x11rb::rust_connection::RustConnection, Window), Box<dyn std::error::Error>> {
     let (conn, screen_num) = x11rb::connect(None)?;
-    let screen = &conn.setup().roots[screen_num];
+    let (root, visual) = {
+        let screen = &conn.setup().roots[screen_num];
+        (screen.root, screen.root_visual)
+    };
     let win = conn.generate_id()?;
     conn.create_window(
         x11rb::COPY_DEPTH_FROM_PARENT,
         win,
-        screen.root,
+        root,
         0,
         0,
         1,
         1,
         0,
         WindowClass::INPUT_OUTPUT,
-        screen.root_visual,
+        visual,
         &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
     )?;
+    Ok((conn, win))
+}
+
+fn run(entries: Vec<Entry>, selection: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (conn, win) = selection_window()?;
     let atom = |name: &str| -> Result<Atom, Box<dyn std::error::Error>> {
         Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
     };

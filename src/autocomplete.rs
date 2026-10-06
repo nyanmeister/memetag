@@ -2,7 +2,10 @@
 //! Philomena (https://github.com/philomena-dev/philomena/blob/master/openapi.yaml).
 //! Names only, suggestions only: no external implications, aliases or tags are
 //! applied automatically. No network requests are made while typing.
-use crate::{index::Db, Cfg};
+use crate::{
+    index::{Db, FileRow},
+    Cfg,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
@@ -63,6 +66,29 @@ pub fn load(c: &Cfg) -> Vec<(String, u64, bool)> {
     values
         .into_iter()
         .map(|(tag, (count, own))| (tag, count, own))
+        .collect()
+}
+
+/// Live row counts merged with remembered local vocabulary for both search bars.
+/// History can keep a tag visible after its last file disappears; it is a floor
+/// for suggestion ranking, not an additional count of files.
+pub(crate) fn local_counts(
+    rows: &[FileRow],
+    remembered: &[(String, u64, bool)],
+) -> Vec<(String, u64, bool)> {
+    let mut counts = HashMap::<String, u64>::new();
+    for row in rows {
+        for tag in &row.tags {
+            *counts.entry(tag.clone()).or_default() += 1;
+        }
+    }
+    for (tag, count, _) in remembered {
+        let value = counts.entry(tag.clone()).or_default();
+        *value = (*value).max(*count);
+    }
+    counts
+        .into_iter()
+        .map(|(tag, count)| (tag, count, true))
         .collect()
 }
 
@@ -177,23 +203,8 @@ mod tests {
             vec!["comic".into(), "artist:stonetoss".into()],
         );
         let c = Cfg {
-            sources: None,
-            active_source: None,
-            root: dir.clone(),
-            db: dir.join("index.sqlite"),
-            thumbs: dir.join("thumbs"),
             vocab,
-            preview_fps: 4.0,
-            strip_frames: 8,
-            index_threads: 1,
-            texture_budget_mb: 64,
-            embed_model: None,
-            ocr_model: None,
-            translate_model: None,
-            translate_prompt: String::new(),
-            speech_command: String::new(),
-            ocr_prompt: String::new(),
-            ollama_url: String::new(),
+            ..Cfg::for_tests(&dir)
         };
         let values = load(&c);
         for want in ["stonetoss comic", "comic", "artist:stonetoss"] {

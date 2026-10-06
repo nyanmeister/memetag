@@ -5,8 +5,6 @@ use std::path::Path;
 /// `bytes` are the verified bytes now on disk, so callers never re-read what they just wrote.
 pub struct Outcome {
     pub report: writer::Report,
-    #[allow(dead_code)]
-    pub tags: Vec<String>,
     pub bytes: Vec<u8>,
 }
 
@@ -21,7 +19,7 @@ pub fn apply(
     apply_bytes(c, path, before, ops, extra_fields, true)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn edit_file(
     c: &Cfg,
     path: &Path,
@@ -32,7 +30,7 @@ pub fn edit_file(
     edit_bytes(c, path, before, ops, fields).map(|_| ())
 }
 
-/// Like `edit_file`, but the caller already holds the file's bytes; returns the verified bytes now on disk.
+/// Edit bytes the caller already holds; returns the verified bytes now on disk.
 /// One read before (the caller's) and one after (the writer's verification): nothing else touches the mount.
 pub fn edit_bytes(
     c: &Cfg,
@@ -176,11 +174,7 @@ fn apply_bytes_impl(
             }
         }
     }
-    Ok(Outcome {
-        report,
-        tags: tag_vec,
-        bytes: re,
-    })
+    Ok(Outcome { report, bytes: re })
 }
 
 /// Embed a cached result without modifying its source database (which may be a

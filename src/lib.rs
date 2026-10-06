@@ -20,12 +20,14 @@ pub mod locking;
 pub mod matroska;
 pub mod meta;
 pub mod ocr;
+mod ollama;
 pub mod paths;
 pub mod propose;
 #[cfg(feature = "gui")]
 pub mod propose_card;
 pub mod pull;
 pub mod query;
+mod remote;
 #[cfg(feature = "gui")]
 pub mod search_complete;
 pub mod serve;
@@ -71,7 +73,7 @@ const USAGE: &str = "memetag — tags live inside the files; the index is a cach
                                           push/pull force a direction; on a conflict, --take-mine|--take-theirs|--merge
   memetag rescan <file>...                scan these files again into the index (after a format rule changed)
   memetag refresh-vocabulary              download a bounded supplemental tag vocabulary for offline autocomplete
-  memetag grab [query]                    starts the optional memetag-gui browser\n  memetag grab [query]                    thumbnail window, newest files first, after a quick pull so just-saved files are in it (skipped while OCR runs)
+  memetag grab [query]                    optional memetag-gui browser, newest files first, after a quick pull so just-saved files are in it (skipped while OCR runs)
                                           left-click copies and closes; middle-click copies and stays; Enter copies first hit and stays
                                           Edit on hover or Shift+left-click edits tags and OCR text; Ctrl+S saves (also applies a mass edit)
                                           right-click opens originals in feh (stills) or looping mpv (videos/GIF/APNG/animated WebP); copy errors leave the window open
@@ -144,6 +146,34 @@ pub struct Cfg {
     pub embed_model: Option<PathBuf>,
 }
 
+#[cfg(test)]
+impl Cfg {
+    /// A collection at `root` with its index and thumbnails beside it: no sources registry, no models, an ollama
+    /// URL nothing answers on. A test overrides the fields it is about with struct update syntax, so a new field
+    /// is added here once instead of in every fixture.
+    pub(crate) fn for_tests(root: &std::path::Path) -> Cfg {
+        Cfg {
+            sources: None,
+            active_source: None,
+            root: root.to_path_buf(),
+            db: root.join("index.sqlite"),
+            thumbs: root.join("thumbs"),
+            vocab: vocab::Vocab::default(),
+            preview_fps: 4.0,
+            strip_frames: 8,
+            index_threads: 1,
+            texture_budget_mb: 64,
+            ocr_model: None,
+            translate_model: None,
+            translate_prompt: String::new(),
+            speech_command: String::new(),
+            ocr_prompt: String::new(),
+            ollama_url: "http://127.0.0.1:1".into(),
+            embed_model: None,
+        }
+    }
+}
+
 pub fn cfg() -> Cfg {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
     let cfg_dir = paths::config_dir();
@@ -152,16 +182,13 @@ pub fn cfg() -> Cfg {
     let (mut fps, mut frames) = (4.0f64, 8u32);
     // whisper.cpp with large-v3 and Silero voice detection filters music and noise.
     // Install the executable and both model files separately; speech_command is configurable.
-    let mut embed_model = None::<PathBuf>;
     let mut speech_command = String::from(
         "whisper-cli -m ~/.local/share/whisper/ggml-large-v3.bin --vad -vm ~/.local/share/whisper/ggml-silero-v5.1.2.bin -np -nt -f {wav}",
     );
-    let (mut translate_model, mut translate_prompt) = (
-        None::<String>,
-        String::from("Translate the following segment into English, without additional explanation.\n\n{text}"),
+    let mut translate_prompt = String::from(
+        "Translate the following segment into English, without additional explanation.\n\n{text}",
     );
-    let (mut ocr_model, mut ocr_prompt, mut ollama_url) = (
-        None::<String>,
+    let (mut ocr_prompt, mut ollama_url) = (
         String::from("Free OCR."),
         String::from("http://127.0.0.1:11434"),
     );
@@ -171,54 +198,51 @@ pub fn cfg() -> Cfg {
         .unwrap_or(4)
         / 4)
     .max(1); // leave CPU capacity for foreground applications
-    if let Ok(s) = std::fs::read_to_string(cfg_dir.join("config.toml")) {
-        if let Ok(t) = s.parse::<toml::Table>() {
-            if let Some(r) = t.get("root").and_then(|v| v.as_str()) {
-                root = PathBuf::from(shellexpand(r, &home));
-            }
-            if let Some(v) = t
-                .get("preview_fps")
-                .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
-            {
-                fps = v;
-            }
-            if let Some(v) = t.get("strip_frames").and_then(|v| v.as_integer()) {
-                frames = v.clamp(2, 64) as u32;
-            }
-            if let Some(v) = t.get("index_threads").and_then(|v| v.as_integer()) {
-                threads = v.clamp(1, 64) as usize;
-            }
-            if let Some(v) = t.get("texture_budget_mb").and_then(|v| v.as_integer()) {
-                tex_mb = v.clamp(64, 65536) as usize;
-            }
-            if let Some(v) = t.get("ocr_model").and_then(|v| v.as_str()) {
-                if !v.is_empty() {
-                    ocr_model = Some(v.to_string());
-                }
-            }
-            if let Some(v) = t.get("ocr_prompt").and_then(|v| v.as_str()) {
-                ocr_prompt = v.to_string();
-            }
-            if let Some(v) = t.get("translate_model").and_then(|v| v.as_str()) {
-                if !v.is_empty() {
-                    translate_model = Some(v.to_string());
-                }
-            }
-            if let Some(v) = t.get("translate_prompt").and_then(|v| v.as_str()) {
-                translate_prompt = v.to_string();
-            }
-            if let Some(v) = t.get("embed_model").and_then(|v| v.as_str()) {
-                if !v.is_empty() {
-                    embed_model = Some(PathBuf::from(v));
-                }
-            }
-            if let Some(v) = t.get("speech_command").and_then(|v| v.as_str()) {
-                speech_command = v.to_string();
-            }
-            if let Some(v) = t.get("ollama_url").and_then(|v| v.as_str()) {
-                ollama_url = v.trim_end_matches('/').to_string();
-            }
+             // A config.toml that does not parse used to fall through to every default, root included, so one typo quietly
+             // pointed a command at the sample collection; now it is said once and the command stops (2026-10-05).
+    let t = match paths::config_table() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("memetag: {e}");
+            std::process::exit(2);
         }
+    };
+    let text = |key: &str| t.get(key).and_then(|v| v.as_str());
+    let int = |key: &str| t.get(key).and_then(|v| v.as_integer());
+    // an empty model name means "none configured"; an empty prompt or command is kept as given
+    let name = |key: &str| text(key).filter(|v| !v.is_empty()).map(str::to_string);
+    if let Some(r) = text("root") {
+        root = PathBuf::from(shellexpand(r, &home));
+    }
+    if let Some(v) = t
+        .get("preview_fps")
+        .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
+    {
+        fps = v;
+    }
+    if let Some(v) = int("strip_frames") {
+        frames = v.clamp(2, 64) as u32;
+    }
+    if let Some(v) = int("index_threads") {
+        threads = v.clamp(1, 64) as usize;
+    }
+    if let Some(v) = int("texture_budget_mb") {
+        tex_mb = v.clamp(64, 65536) as usize;
+    }
+    let ocr_model = name("ocr_model");
+    let translate_model = name("translate_model");
+    let embed_model = name("embed_model").map(PathBuf::from);
+    if let Some(v) = text("ocr_prompt") {
+        ocr_prompt = v.to_string();
+    }
+    if let Some(v) = text("translate_prompt") {
+        translate_prompt = v.to_string();
+    }
+    if let Some(v) = text("speech_command") {
+        speech_command = v.to_string();
+    }
+    if let Some(v) = text("ollama_url") {
+        ollama_url = v.trim_end_matches('/').to_string();
     }
     if let Some(v) = std::env::var("MEMETAG_TEX_MB")
         .ok()
@@ -347,9 +371,9 @@ pub fn cli_main() {
         Some("reindex") => cmd_reindex(),
         Some("folders") => library::run(&cfg(), &a[2..]),
         Some("sources") => sources::run(&cfg(), &a[2..]),
-        Some("search") => cmd_search(&a[2..].join(" "), false),
+        Some("search") => cmd_search(&a[2..].join(" ")),
         Some("serve") => serve::run(&cfg(), &a[2..]),
-        Some("untagged") => cmd_search("tag_count:0", false),
+        Some("untagged") => cmd_search("tag_count:0"),
         Some("tags") => cmd_tags(),
         Some("reimply") => cmd_reimply(),
         Some("vocab") => cmd_vocab(&a[2..]),
@@ -361,10 +385,7 @@ pub fn cli_main() {
             clipboard::serve(a.get(2).map(String::as_str).unwrap_or("CLIPBOARD"))
         }
         Some("pull") => pull::run(&cfg(), &a[2..]),
-        Some("grab") => {
-            let c = cfg();
-            launch_gui(&c, &a[2..].join(" "))
-        }
+        Some("grab") => launch_gui(&a[2..].join(" ")),
         Some("clip") if a.len() == 3 => grab::clip(&cfg(), &a[2]),
         Some("thumbs") => grab::build_thumbs(&cfg(), None),
         Some("ocr") => ocr::run(&cfg(), &a[2..]),
@@ -664,7 +685,7 @@ fn cmd_tags() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_search(q: &str, grab: bool) -> Result<(), String> {
+fn cmd_search(q: &str) -> Result<(), String> {
     let c = cfg();
     let db = index::Db::open_cfg(&c)?;
     let mut expr = query::parse(q)?;
@@ -686,9 +707,6 @@ fn cmd_search(q: &str, grab: bool) -> Result<(), String> {
         .iter()
         .filter(|f| query::eval(&expr, &query::Item::of(f, &similar), &alias))
         .collect();
-    if grab {
-        return grab::grab(&c, &db, q, &hits);
-    }
     for f in &hits {
         println!("{}", c.file_path(&f.path)?.display());
     }
@@ -731,7 +749,7 @@ pub fn companion(name: &str) -> Result<PathBuf, String> {
     ))
 }
 
-pub fn launch_gui(_c: &Cfg, query: &str) -> Result<(), String> {
+pub fn launch_gui(query: &str) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     Err(std::process::Command::new(companion("memetag-gui")?)
         .arg(query)

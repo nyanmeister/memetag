@@ -35,6 +35,10 @@ private Xvfb display for GUI checks and must not send input to a real desktop.
   Scan/write network collections on their configured file server; do not bypass
   mount checks. Reject stale edits and stale vocabulary saves. Content IDs exclude
   XMP: use SHA-256 of the complete file for edit revisions, never a content ID.
+- `src/remote.rs`: shared source routing and SSH options. Pull, Edit and View
+  deliberately choose different legacy settings; a viewing server is not a writer.
+- `src/ollama.rs`: common OCR/action-tag completion request. Preserve each caller's
+  output budget, model checks, timeouts and handling of reviewed or empty text.
 - `src/grid.rs`, `editor.rs`, `library_ui.rs`: desktop views; `serve.rs`: the phone
   browser grid. Keep blocking filesystem/network work off desktop UI threads.
 

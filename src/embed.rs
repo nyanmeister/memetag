@@ -180,23 +180,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("memetag-embed-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let c = Cfg {
-            sources: None,
-            active_source: None,
-            root: root.clone(),
             db: root.join("source.sqlite"),
-            thumbs: root.join("thumbs"),
             vocab: crate::vocab::Vocab::load(&root.join("no-vocab")),
-            preview_fps: 4.0,
-            strip_frames: 8,
-            index_threads: 1,
-            texture_budget_mb: 64,
-            embed_model: None,
-            ocr_model: None,
-            ocr_prompt: String::new(),
-            translate_model: None,
-            translate_prompt: String::new(),
-            speech_command: String::new(),
-            ollama_url: "http://127.0.0.1:1".into(),
+            ..Cfg::for_tests(&root)
         };
         let db = crate::index::Db::open_cfg(&c).unwrap();
         for ext in ["png", "jpg", "gif", "webp"] {

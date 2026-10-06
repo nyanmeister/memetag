@@ -66,10 +66,7 @@ pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
     }
     // config.toml: `share_command` ("{file}" is replaced), `share_stage` (copy into the cache first),
     // `mount_command` (run when an original is missing, before giving up).
-    let table = std::fs::read_to_string(crate::paths::config_dir().join("config.toml"))
-        .ok()
-        .and_then(|s| s.parse::<toml::Table>().ok())
-        .unwrap_or_default();
+    let table = crate::paths::config_table()?;
     let text = |k: &str| table.get(k).and_then(|v| v.as_str()).map(str::to_string);
     let (cfg_share, mount_command) = (text("share_command"), text("mount_command"));
     let cfg_stage = table.get("share_stage").and_then(|v| v.as_bool());
@@ -182,17 +179,7 @@ fn tags(s: &Shared) -> Result<Arc<Vec<(String, u64, bool)>>, String> {
     let now = index_mtime(&s.c.db);
     let mut g = s.tags.lock().map_err(|_| "tags lock poisoned")?;
     if g.0 != now || g.1.is_empty() {
-        let mut counts = HashMap::<String, u64>::new();
-        for row in rows.iter() {
-            for tag in &row.tags {
-                *counts.entry(tag.clone()).or_default() += 1;
-            }
-        }
-        for (tag, count, _) in &s.remembered {
-            let v = counts.entry(tag.clone()).or_default();
-            *v = (*v).max(*count);
-        }
-        let values = counts.into_iter().map(|(t, n)| (t, n, true)).collect();
+        let values = autocomplete::local_counts(&rows, &s.remembered);
         *g = (now, Arc::new(values));
     }
     Ok(g.1.clone())

@@ -34,18 +34,22 @@ pub fn is_ours(ns: &str) -> bool {
 /// Pick the namespaces once per process, before any file is read: config.toml keys `xmp_namespace` and
 /// `legacy_xmp_namespaces`, then the environment. A second call is ignored, so tests can set their own first.
 pub fn init() {
-    let mut write = None::<String>;
-    let mut legacy = Vec::new();
-    if let Ok(s) = std::fs::read_to_string(crate::paths::config_dir().join("config.toml")) {
-        if let Ok(t) = s.parse::<toml::Table>() {
-            if let Some(v) = t.get("xmp_namespace").and_then(|v| v.as_str()) {
-                write = Some(v.to_string());
-            }
-            if let Some(a) = t.get("legacy_xmp_namespaces").and_then(|v| v.as_array()) {
-                legacy.extend(a.iter().filter_map(|v| v.as_str()).map(str::to_string));
-            }
-        }
-    }
+    // a file that does not parse is reported by `cfg()`, which every command runs first; here it counts as empty
+    let t = crate::paths::config_table().unwrap_or_default();
+    let mut write = t
+        .get("xmp_namespace")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let mut legacy: Vec<String> = t
+        .get("legacy_xmp_namespaces")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     if let Ok(v) = std::env::var("MEMETAG_XMP_NAMESPACE") {
         write = Some(v);
     }

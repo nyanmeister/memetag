@@ -70,18 +70,7 @@ pub fn distance(a: &[u8], b: &[u8]) -> u32 {
 
 /// Every cached hash, by path.
 pub fn cached(db: &Db) -> Result<HashMap<String, Vec<u8>>, String> {
-    let mut st = db
-        .conn
-        .prepare("SELECT path, hash FROM phash2 WHERE alg=?1")
-        .map_err(|e| e.to_string())?;
-    let v = st
-        .query_map([ALG], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .collect();
-    Ok(v)
+    Ok(db.cached_blobs(ALG)?.into_iter().collect())
 }
 /// Whether anyone has asked for image search on this index yet (pull keeps the cache complete only then).
 pub fn in_use(db: &Db) -> bool {
@@ -352,7 +341,7 @@ pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
         } else {
             format!("{}@{max}", crate::query::quote_tag(file))
         };
-        return crate::launch_gui(c, &format!("similar:{spec}"));
+        return crate::launch_gui(&format!("similar:{spec}"));
     }
     let db = Db::open_cfg(&c)?;
     let rows = db.all()?;

@@ -234,21 +234,10 @@ impl Db {
         Ok(Db { conn, scope })
     }
 
-    /// Scan + write one file from disk (tests and tools; the live paths use `upsert_bytes`).
-    #[allow(dead_code)]
+    /// Test fixture helper; live writes use source-aware `upsert_cfg`.
+    #[cfg(test)]
     pub fn upsert_file(&self, root: &Path, path: &Path, vocab: &Vocab) -> Result<FileRow, String> {
         self.write_scan(scan_file(root, path, vocab)?)
-    }
-    /// Same, from bytes the caller already holds (a just-verified write): only a stat touches the file.
-    pub fn upsert_bytes(
-        &self,
-        root: &Path,
-        path: &Path,
-        bytes: &[u8],
-        vocab: &Vocab,
-    ) -> Result<FileRow, String> {
-        let md = std::fs::metadata(path).map_err(|e| e.to_string())?;
-        self.write_scan(scan_bytes(root, path, bytes, &md, vocab))
     }
     pub fn upsert_cfg(&self, c: &Cfg, path: &Path, bytes: &[u8]) -> Result<FileRow, String> {
         c.ensure_current()?;
@@ -584,28 +573,12 @@ impl Db {
     /// file. Returns each file whose tag set changed, with its new full tag set (xmp, folder and implied together).
     pub fn reimply(&self, vocab: &Vocab) -> Result<Vec<(String, BTreeSet<String>)>, String> {
         let mut base: HashMap<String, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new(); // path -> (own, old implied)
-        {
-            let mut st = self
-                .conn
-                .prepare("SELECT path, tag, source FROM tags")
-                .map_err(|e| e.to_string())?;
-            for r in st
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(|e| e.to_string())?
-            {
-                let (p, t, s) = r.map_err(|e| e.to_string())?;
-                let e = base.entry(p).or_default();
-                if s == "implied" {
-                    e.1.insert(t);
-                } else {
-                    e.0.insert(t);
-                }
+        for (p, t, s) in self.tag_rows()? {
+            let e = base.entry(p).or_default();
+            if s == "implied" {
+                e.1.insert(t);
+            } else {
+                e.0.insert(t);
             }
         }
         let mut changed = vec![];
@@ -644,6 +617,42 @@ impl Db {
                 |r| r.get(0),
             )
             .ok()
+    }
+    /// Every `phash2` row of one algorithm whose path is in this scope, as (path, bytes): the perceptual hashes
+    /// (`similar::ALG`) and the CLIP vectors (`propose::ALG`) share the table.
+    pub fn cached_blobs(&self, alg: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT path, hash FROM phash2 WHERE alg=?1")
+            .map_err(|e| e.to_string())?;
+        let v = st
+            .query_map([alg], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .filter(|(p, _)| self.scope.contains(Path::new(p)))
+            .collect();
+        Ok(v)
+    }
+    /// Every tag row as (path, tag, source), source being `xmp`, `folder` or `implied`.
+    pub fn tag_rows(&self) -> Result<Vec<(String, String, String)>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT path, tag, source FROM tags")
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
     }
     pub fn tag_counts(&self) -> Result<Vec<(String, i64)>, String> {
         let mut counts = HashMap::<String, i64>::new();

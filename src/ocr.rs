@@ -6,7 +6,6 @@
 //! built to run under a systemd unit that can be stopped and started again at will (2026-09-12).
 use crate::index::Db;
 use crate::Cfg;
-use base64::Engine as _;
 use rusqlite::params;
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -459,24 +458,6 @@ pub fn image_bytes(path: &std::path::Path, format: &str) -> Result<Vec<u8>, Stri
     Ok(out.into_inner())
 }
 
-/// Whether ollama at `url` has `model` pulled. An exact tag match is required; a config value with no `:tag` matches any
-/// tag of that base (so `qwen3-vl` finds `qwen3-vl:latest`), but a specific tag never matches a different one.
-fn ollama_has_model(url: &str, model: &str) -> Result<bool, String> {
-    let tags: serde_json::Value = ureq::get(&format!("{url}/api/tags"))
-        .timeout(std::time::Duration::from_secs(5))
-        .call()
-        .map_err(|e| format!("ollama at {url} did not list its models: {e}"))?
-        .into_json()
-        .map_err(|e| format!("ollama /api/tags response: {e}"))?;
-    Ok(tags["models"].as_array().is_some_and(|ms| {
-        ms.iter().any(|m| {
-            m["name"].as_str().is_some_and(|n| {
-                n == model || (!model.contains(':') && n.split(':').next() == Some(model))
-            })
-        })
-    }))
-}
-
 fn run_ollama(
     c: &Cfg,
     db: &Db,
@@ -486,19 +467,10 @@ fn run_ollama(
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let url = format!("{}/api/generate", c.ollama_url);
-    // is the server there? (systemd Wants= starts it, but say something useful if not)
-    ureq::get(&format!("{}/api/version", c.ollama_url))
-        .timeout(std::time::Duration::from_secs(5))
-        .call()
-        .map_err(|e| {
-            format!(
-                "ollama not reachable at {}: {e} (systemctl --user start ollama)",
-                c.ollama_url
-            )
-        })?;
+    crate::ollama::reachable(&c.ollama_url)?;
     // Check the configured server's model once, rather than reporting a 404 for every image.
     // Clients without an OCR engine can still read text embedded by another machine.
-    if !ollama_has_model(&c.ollama_url, &o.model)? {
+    if !crate::ollama::has_model(&c.ollama_url, &o.model)? {
         return Err(format!(
             "the OCR model `{}` is not installed in ollama at {}. Install it with `ollama pull {}` \
              on that server, or configure ocr_model and ollama_url for an available OCR engine. \
@@ -527,25 +499,15 @@ fn run_ollama(
     let (mut n, mut with_text, mut errs, mut embedded, mut consecutive_errs) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
     let t0 = Instant::now();
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(300))
-        .build();
+    let agent = crate::ollama::agent();
     let mut rc = Ok(());
     for (rel, _format, bytes) in rx.iter() {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         let t = Instant::now();
-        let res: Result<String, String> = bytes.and_then(|b| {
-            let body = serde_json::json!({ "model": o.model, "prompt": o.prompt, "images": [base64::engine::general_purpose::STANDARD.encode(&b)], "stream": false,
-                                           "options": { "temperature": 0, "num_predict": 700, "num_ctx": 8192 }, "keep_alive": "30m" });
-            // num_ctx: ollama defaults to 4096, and qwen3-vl's image tokens alone reach ~4150 for near-square
-            // images at the processor's cap (measured 2026-09-13: HTTP 400 "request (4117 tokens) exceeds the
-            // available context size (4096)"). 8192 costs ~1.2 GB of KV cache on the 16 GB card and leaves room
-            // for the prompt and 700 output tokens.
-            let resp = agent.post(&url).send_json(body).map_err(|e| format!("ollama: {e}"))?;
-            let j: serde_json::Value = resp.into_json().map_err(|e| format!("ollama json: {e}"))?;
-            Ok(clean_model(j.get("response").and_then(|v| v.as_str()).unwrap_or("")))
+        let res = bytes.and_then(|b| {
+            crate::ollama::generate(&agent, &url, &o.model, &o.prompt, Some(&b), 700)
         });
         let secs = t.elapsed().as_secs_f64();
         n += 1;

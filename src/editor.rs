@@ -418,25 +418,7 @@ mod tests {
     fn edits_preserve_file_and_override_an_old_ocr_worker() {
         let root = std::env::temp_dir().join(format!("memetag-editor-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        let c = Cfg {
-            sources: None,
-            active_source: None,
-            root: root.clone(),
-            db: root.join("index.sqlite"),
-            thumbs: root.join("thumbs"),
-            vocab: crate::vocab::Vocab::default(),
-            preview_fps: 4.0,
-            strip_frames: 8,
-            index_threads: 1,
-            texture_budget_mb: 64,
-            embed_model: None,
-            ocr_model: None,
-            ocr_prompt: String::new(),
-            translate_model: None,
-            translate_prompt: String::new(),
-            speech_command: String::new(),
-            ollama_url: "http://127.0.0.1:1".into(),
-        };
+        let c = Cfg::for_tests(&root);
         let db = Db::open_cfg(&c).unwrap();
         for rel in [
             "test.png",

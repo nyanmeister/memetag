@@ -113,20 +113,11 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Every cached vector, by path.
 pub fn cached(db: &Db) -> Result<HashMap<String, Vec<f32>>, String> {
-    let mut st = db
-        .conn
-        .prepare("SELECT path, hash FROM phash2 WHERE alg=?1")
-        .map_err(|e| e.to_string())?;
-    let v = st
-        .query_map([ALG], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .filter(|(p, _)| db.scope.contains(std::path::Path::new(p)))
+    Ok(db
+        .cached_blobs(ALG)?
+        .into_iter()
         .filter_map(|(p, b)| from_bytes(&b).map(|v| (p, v)))
-        .collect();
-    Ok(v)
+        .collect())
 }
 
 /// The cache with every image row in `rows` embedded: the missing ones are read now from the thumbnail (else the

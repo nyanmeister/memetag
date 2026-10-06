@@ -1,6 +1,7 @@
 //! Reviewed tag-only batches. Shared media are edited on their server; only
 //! metadata scans cross SSH back to the desktop index. One request is in flight
 //! at a time, so Stop/EOF leaves no queued file writes behind.
+use crate::remote::{configured as remote, Purpose, Remote};
 #[cfg(feature = "gui")]
 use crate::widgets::{self, TagInput};
 #[cfg(any(feature = "gui", test))]
@@ -16,7 +17,7 @@ use std::{
     collections::BTreeSet,
     io::{BufRead, Write},
     path::{Component, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 #[cfg(any(feature = "gui", test))]
 use std::{
@@ -189,63 +190,6 @@ pub fn worker() -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct Remote {
-    local_root: PathBuf,
-    root: PathBuf,
-    host: String,
-    command: String,
-}
-fn remote(c: &Cfg) -> Result<Option<Remote>, String> {
-    configured_remote(c, false)
-}
-
-fn configured_remote(c: &Cfg, viewing: bool) -> Result<Option<Remote>, String> {
-    if let Some(library) = c.library()? {
-        let source = library.source(c.active_source.as_deref().unwrap_or("main"))?;
-        if let Some(remote) = &source.remote {
-            return Ok(Some(Remote {
-                local_root: source.path.clone(),
-                root: remote.root.clone(),
-                host: remote.host.clone(),
-                command: remote.batch_command.clone(),
-            }));
-        }
-    }
-    let path = crate::paths::config_dir().join("config.toml");
-    if let Ok(text) = std::fs::read_to_string(path) {
-        let table: toml::Table = text
-            .parse()
-            .map_err(|e| format!("Batch configuration: {e}"))?;
-        let sections: &[&str] = if viewing {
-            &["pull_remote", "batch_remote"]
-        } else {
-            &["batch_remote"]
-        };
-        for value in sections.iter().filter_map(|section| table.get(*section)) {
-            let r: Remote = value
-                .clone()
-                .try_into()
-                .map_err(|e| format!("Batch configuration: {e}"))?;
-            if c.root == r.local_root {
-                if r.host.is_empty()
-                    || r.host.starts_with('-')
-                    || r.host.chars().any(char::is_whitespace)
-                {
-                    return Err("Invalid batch server host".into());
-                }
-                return Ok(Some(r));
-            }
-        }
-    }
-    if requires_remote(&c.root)? {
-        return Err(
-            "Editing a network collection needs a matching batch_remote configuration".into(),
-        );
-    }
-    Ok(None)
-}
-
 pub(crate) fn requires_remote(path: &std::path::Path) -> Result<bool, String> {
     let mounts = std::fs::read_to_string("/proc/self/mountinfo")
         .map_err(|e| format!("Cannot determine collection filesystem: {e}"))?;
@@ -300,7 +244,7 @@ fn network_root(root: &std::path::Path, mounts: &str) -> bool {
 /// old bytes for minutes, including after our own successful save.
 pub fn read_for_edit(c: &Cfg, path: &std::path::Path) -> Result<Vec<u8>, String> {
     let c = c.for_file(path)?;
-    match remote(&c)? {
+    match remote(&c, Purpose::Edit)? {
         Some(remote) => read_server_file(&remote, path, std::path::Path::new("ssh")),
         None => std::fs::read(path).map_err(|e| format!("{}: {e}", path.display())),
     }
@@ -318,7 +262,7 @@ pub(crate) fn read_for_view(c: &Cfg, path: &std::path::Path) -> Result<Vec<u8>, 
     } else {
         c.clone()
     };
-    match configured_remote(&scoped, true)? {
+    match remote(&scoped, Purpose::View)? {
         Some(remote) => read_server_file(&remote, path, std::path::Path::new("ssh")),
         None => read_for_edit(c, path),
     }
@@ -345,19 +289,7 @@ fn read_server_file(
         .to_str()
         .ok_or("Remote file path is not UTF-8")?;
     let command = format!("cat -- '{}'", server_path.replace('\'', "'\\''"));
-    let output = Command::new(ssh)
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=10",
-            "-o",
-            "ServerAliveCountMax=3",
-            &remote.host,
-            &command,
-        ])
+    let output = crate::remote::ssh(ssh, &remote.host, &command, 10)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("Read file from {}: {e}", remote.host))?;
@@ -379,7 +311,7 @@ pub fn write_remote(
     packet: &str,
 ) -> Result<Option<crate::writer::Written>, String> {
     let c = c.for_file(path)?;
-    let Some(remote) = remote(&c)? else {
+    let Some(remote) = remote(&c, Purpose::Edit)? else {
         return Ok(None);
     };
     let rel = path
@@ -395,19 +327,7 @@ pub fn write_remote(
         replacement: crate::writer::revision(after),
         packet: packet.into(),
     };
-    let mut child = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=10",
-            "-o",
-            "ServerAliveCountMax=3",
-            &remote.host,
-            &remote.command,
-        ])
+    let mut child = crate::remote::ssh("ssh", &remote.host, &remote.command, 10)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -503,23 +423,11 @@ fn run_source(
 ) -> Result<Vec<FileRow>, String> {
     let finish = || -> Result<Vec<FileRow>, String> {
         let db = Db::open_cfg(&c)?;
-        let target = remote(&c)?;
+        let target = remote(&c, Purpose::Edit)?;
         let mut child = if let Some(r) = &target {
             // Configured command only. File paths and tags travel as JSON on stdin.
             Some(
-                Command::new("ssh")
-                    .args([
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "ConnectTimeout=10",
-                        "-o",
-                        "ServerAliveInterval=10",
-                        "-o",
-                        "ServerAliveCountMax=3",
-                        &r.host,
-                        &r.command,
-                    ])
+                crate::remote::ssh("ssh", &r.host, &r.command, 10)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())

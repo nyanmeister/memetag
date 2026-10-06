@@ -374,6 +374,13 @@ impl App {
             }
         });
     }
+    /// Open the editor on row `i` (Edit on hover, Shift+click, the Propose card's Edit, "next untagged").
+    fn edit(&mut self, i: usize, ctx: &egui::Context) {
+        self.editing = Some((
+            i,
+            crate::editor::EditorUi::new(self.cfg.clone(), self.rows[i].path.clone(), ctx.clone()),
+        ));
+    }
     fn open_external(&mut self, index: usize, ctx: &egui::Context) {
         let path = match self.cfg.file_path(&self.rows[index].path) {
             Ok(p) => p,
@@ -852,16 +859,7 @@ impl App {
             .copied()
             .find(|&i| i != current && tier(&self.rows[i]) != Tier::Tagged);
         match next {
-            Some(i) => {
-                self.editing = Some((
-                    i,
-                    crate::editor::EditorUi::new(
-                        self.cfg.clone(),
-                        self.rows[i].path.clone(),
-                        ctx.clone(),
-                    ),
-                ));
-            }
+            Some(i) => self.edit(i, ctx),
             None => {
                 self.toast = Some((
                     "Nothing left to tag in these results".into(),
@@ -1080,16 +1078,7 @@ impl App {
             crate::propose_card::Action::None => {}
             crate::propose_card::Action::Open(i) => self.open_external(i, ctx),
             crate::propose_card::Action::Copy(i) => self.copy(i, false, ctx),
-            crate::propose_card::Action::Edit(i) => {
-                self.editing = Some((
-                    i,
-                    crate::editor::EditorUi::new(
-                        self.cfg.clone(),
-                        self.rows[i].path.clone(),
-                        ctx.clone(),
-                    ),
-                ));
-            }
+            crate::propose_card::Action::Edit(i) => self.edit(i, ctx),
             crate::propose_card::Action::Apply {
                 tag,
                 accept,
@@ -1712,14 +1701,7 @@ impl App {
         if let Some(i) = similar_to {
             self.show_similar(i);
         } else if let Some(i) = edit {
-            self.editing = Some((
-                i,
-                crate::editor::EditorUi::new(
-                    self.cfg.clone(),
-                    self.rows[i].path.clone(),
-                    ctx.clone(),
-                ),
-            ));
+            self.edit(i, ctx);
         } else if let Some(i) = preview {
             self.open_external(i, ctx);
         } else if let Some((i, close)) = clicked {

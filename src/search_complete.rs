@@ -1,7 +1,6 @@
 //! Local search-bar completion. Syntax reference/credit is in query::quote_tag.
 use crate::{autocomplete, index::FileRow, query, widgets, Cfg};
 use eframe::egui;
-use std::collections::HashMap;
 
 pub struct SearchComplete {
     remembered: Vec<(String, u64, bool)>,
@@ -35,20 +34,7 @@ impl SearchComplete {
         this
     }
     pub fn refresh(&mut self, rows: &[FileRow]) {
-        let mut counts = HashMap::<String, u64>::new();
-        for row in rows {
-            for tag in &row.tags {
-                *counts.entry(tag.clone()).or_default() += 1;
-            }
-        }
-        for (tag, count, _) in &self.remembered {
-            let value = counts.entry(tag.clone()).or_default();
-            *value = (*value).max(*count);
-        }
-        self.values = counts
-            .into_iter()
-            .map(|(tag, count)| (tag, count, true))
-            .collect();
+        self.values = autocomplete::local_counts(rows, &self.remembered);
     }
     /// Escape while the suggestions show: keep them closed until the query changes. Returns whether there was anything
     /// to dismiss, so the grid knows the key is spent. Judged on the frame's entry state: egui drops the field's focus

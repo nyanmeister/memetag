@@ -108,16 +108,7 @@ pub struct Ssh {
 }
 impl Ssh {
     fn ssh(&self, remote_cmd: &str) -> Command {
-        let mut c = Command::new("ssh");
-        c.args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            &format!("ConnectTimeout={}", self.connect_timeout),
-            &self.host,
-            remote_cmd,
-        ]);
-        c
+        crate::remote::ssh("ssh", &self.host, remote_cmd, self.connect_timeout)
     }
 }
 impl Canonical for Ssh {
@@ -482,15 +473,7 @@ pub fn resolve_merge(
     resolved: &[(String, String)],
 ) -> Result<Vec<AliasClash>, String> {
     let _lock = Vocab::lock(&env.vocab_path)?;
-    let local = Vocab::load(&env.vocab_path);
-    if let Some(e) = &local.broken {
-        return Err(format!("{} did not parse ({e})", env.vocab_path.display()));
-    }
-    let bytes = store
-        .fetch()?
-        .ok_or("the server has no canonical vocab to merge")?;
-    let canon: Vocab = toml::from_str(&String::from_utf8_lossy(&bytes))
-        .map_err(|e| format!("the canonical vocab did not parse ({e})"))?;
+    let (local, bytes, canon) = both_sides(store, env)?;
     let (mut merged, clashes) = merge(&local, &canon);
     if clashes.iter().any(|c| {
         !resolved
@@ -524,6 +507,13 @@ pub fn resolve_merge(
 
 /// The union without writing anything, so a caller can show the clashes and decide before committing.
 pub fn preview_merge(store: &dyn Canonical, env: &Env) -> Result<(Vocab, Vec<AliasClash>), String> {
+    let (local, _, canon) = both_sides(store, env)?;
+    Ok(merge(&local, &canon))
+}
+
+/// The local file (a broken one is refused, never merged over) and the server's canonical copy, which comes back
+/// parsed and as the bytes a later compare-and-swap must present.
+fn both_sides(store: &dyn Canonical, env: &Env) -> Result<(Vocab, Vec<u8>, Vocab), String> {
     let local = Vocab::load(&env.vocab_path);
     if let Some(e) = &local.broken {
         return Err(format!("{} did not parse ({e})", env.vocab_path.display()));
@@ -533,7 +523,7 @@ pub fn preview_merge(store: &dyn Canonical, env: &Env) -> Result<(Vocab, Vec<Ali
         .ok_or("the server has no canonical vocab to merge")?;
     let canon: Vocab = toml::from_str(&String::from_utf8_lossy(&bytes))
         .map_err(|e| format!("the canonical vocab did not parse ({e})"))?;
-    Ok(merge(&local, &canon))
+    Ok((local, bytes, canon))
 }
 
 /// The store for the configured server, or `None` when the root is local (nothing to sync against).

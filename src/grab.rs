@@ -413,49 +413,6 @@ pub fn build_thumbs(c: &Cfg, only: Option<&[&FileRow]>) -> Result<(), String> {
     Ok(())
 }
 
-pub fn grab(c: &Cfg, _db: &Db, q: &str, hits: &[&FileRow]) -> Result<(), String> {
-    if std::env::var("MEMETAG_FEH").is_err() {
-        return crate::launch_gui(c, q);
-    }
-    if hits.is_empty() {
-        return Err(format!("nothing matches {q:?}"));
-    }
-    let thumbs = ensure_thumbs(c, hits);
-    if thumbs.is_empty() {
-        return Err("no thumbnails could be made".into());
-    }
-    let me = crate::self_exe().ok_or("memetag CLI is not installed")?;
-    let mut cmd = Command::new("feh");
-    cmd.args([
-        "--thumbnails",
-        "--thumb-width",
-        "220",
-        "--thumb-height",
-        "220",
-        "--limit-width",
-        "1400",
-        "--index-info",
-        "",
-        "--title",
-        &format!(
-            "memetag: {q}  ({} hits) — click = copy to clipboard",
-            hits.len()
-        ),
-        "--action",
-        &format!("{} clip %F", me.display()),
-    ]);
-    for (t, _) in &thumbs {
-        cmd.arg(t);
-    }
-    eprintln!("{} thumbnails → feh (click one to copy it)", thumbs.len());
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("feh: {e}"))?;
-    Ok(())
-}
-
 /// `arg` may be a thumbnail path (…/thumbs/<key>.png), an id prefix, or a real file path.
 pub fn clip(c: &Cfg, arg: &str) -> Result<(), String> {
     let db = Db::open_cfg(&c)?;
@@ -603,23 +560,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("memetag-grab-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let c = Cfg {
-            sources: None,
-            active_source: None,
             root: root.join("memes"),
-            db: root.join("index.sqlite"),
-            thumbs: root.join("thumbs"),
-            vocab: Default::default(),
             preview_fps: 12.0,
             strip_frames: 24,
-            index_threads: 1,
-            texture_budget_mb: 64,
-            embed_model: None,
-            ocr_model: None,
-            ocr_prompt: String::new(),
-            translate_model: None,
-            translate_prompt: String::new(),
-            speech_command: String::new(),
-            ollama_url: String::new(),
+            ..Cfg::for_tests(&root)
         };
         std::fs::create_dir_all(&c.thumbs).unwrap();
         let rows = vec![
@@ -729,23 +673,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("memetag-webp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let c = Cfg {
-            sources: None,
-            active_source: None,
             root: root.join("memes"),
-            db: root.join("index.sqlite"),
-            thumbs: root.join("thumbs"),
-            vocab: Default::default(),
             preview_fps: 12.0,
             strip_frames: 24,
-            index_threads: 1,
-            texture_budget_mb: 64,
-            embed_model: None,
-            ocr_model: None,
-            ocr_prompt: String::new(),
-            translate_model: None,
-            translate_prompt: String::new(),
-            speech_command: String::new(),
-            ollama_url: String::new(),
+            ..Cfg::for_tests(&root)
         };
         std::fs::create_dir_all(&c.thumbs).unwrap();
         std::fs::create_dir_all(&c.root).unwrap();

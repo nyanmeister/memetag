@@ -39,24 +39,8 @@ pub fn export(c: &Cfg) -> Result<(), String> {
     let db = Db::open_cfg(&c)?;
     let rows = db.all()?;
     let mut sources: std::collections::HashMap<String, Vec<(String, String)>> = Default::default();
-    {
-        let mut st = db
-            .conn
-            .prepare("SELECT path, tag, source FROM tags")
-            .map_err(|e| e.to_string())?;
-        for r in st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .filter_map(Result::ok)
-        {
-            sources.entry(r.0).or_default().push((r.1, r.2));
-        }
+    for (path, tag, source) in db.tag_rows()? {
+        sources.entry(path).or_default().push((tag, source));
     }
     let out = std::io::stdout();
     let mut w = std::io::BufWriter::new(out.lock());

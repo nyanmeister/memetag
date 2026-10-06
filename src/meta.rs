@@ -7,8 +7,8 @@
 //! `Description (machine):`), after a blank line; a rerun replaces its own block. Reviewed text keeps its mark and the
 //! block is added under it. Action rules: write straight in, no preview; request → done-tag, never
 //! a plain erase; check for an audio track before anything is sent to whisper.
+use crate::ollama::generate;
 use crate::{index::Db, Cfg};
-use base64::Engine;
 use rusqlite::params;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -113,31 +113,6 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         i += 1;
     }
     Ok(o)
-}
-
-/// One ollama completion; `image` is None for a text-only model.
-fn generate(
-    agent: &ureq::Agent,
-    url: &str,
-    model: &str,
-    prompt: &str,
-    image: Option<&[u8]>,
-) -> Result<String, String> {
-    let mut body = serde_json::json!({
-        "model": model, "prompt": prompt, "stream": false,
-        "options": { "temperature": 0, "num_predict": 1200, "num_ctx": 8192 }, "keep_alive": "30m"
-    });
-    if let Some(b) = image {
-        body["images"] = serde_json::json!([base64::engine::general_purpose::STANDARD.encode(b)]);
-    }
-    let resp = agent
-        .post(url)
-        .send_json(body)
-        .map_err(|e| format!("ollama: {e}"))?;
-    let j: serde_json::Value = resp.into_json().map_err(|e| format!("ollama json: {e}"))?;
-    Ok(crate::ocr::clean_model(
-        j.get("response").and_then(|v| v.as_str()).unwrap_or(""),
-    ))
 }
 
 /// Does the file carry an audio stream? Check before launching transcription.
@@ -263,7 +238,7 @@ fn perform(
             let read;
             if source.trim().is_empty() {
                 let image = crate::ocr::image_bytes(&abs, &row.format)?;
-                read = generate(&x.agent, &x.url, model, &c.ocr_prompt, Some(&image))?;
+                read = generate(&x.agent, &x.url, model, &c.ocr_prompt, Some(&image), 1200)?;
                 source = if read.trim().eq_ignore_ascii_case("none") { "" } else { read.trim() };
                 if source.is_empty() {
                     return Err("no text found in the image; the tag stays".into());
@@ -282,7 +257,7 @@ fn perform(
                      Reply with the translation only, no commentary.\n\n{source}"
                 )
             };
-            let english = generate(&x.agent, &x.url, translator, &prompt, None)?;
+            let english = generate(&x.agent, &x.url, translator, &prompt, None, 1200)?;
             if english.trim().is_empty() {
                 return Err("the model returned no translation; the tag stays".into());
             }
@@ -295,7 +270,7 @@ fn perform(
             }
             let model = vision_model(c)?;
             let image = crate::ocr::image_bytes(&abs, &row.format)?;
-            let mut read = generate(&x.agent, &x.url, model, &c.ocr_prompt, Some(&image))?;
+            let mut read = generate(&x.agent, &x.url, model, &c.ocr_prompt, Some(&image), 1200)?;
             if read.trim().eq_ignore_ascii_case("none") {
                 read.clear();
             }
@@ -352,7 +327,7 @@ fn perform(
                           what they are doing, notable objects, and the setting. Name characters, people or brands \
                           if you recognise them. Do not transcribe text in the image and do not add commentary. \
                           Reply with the description only.";
-            let described = generate(&x.agent, &x.url, model, prompt, Some(&image))?;
+            let described = generate(&x.agent, &x.url, model, prompt, Some(&image), 1200)?;
             if described.trim().is_empty() {
                 return Err("the model returned no description; the tag stays".into());
             }
@@ -401,22 +376,12 @@ pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
     }
     let needs_ollama = work.iter().any(|(a, _)| a.request != "meta:speech request");
     if needs_ollama {
-        ureq::get(&format!("{}/api/version", c.ollama_url))
-            .timeout(std::time::Duration::from_secs(5))
-            .call()
-            .map_err(|e| {
-                format!(
-                    "ollama not reachable at {}: {e} (systemctl --user start ollama)",
-                    c.ollama_url
-                )
-            })?;
+        crate::ollama::reachable(&c.ollama_url)?;
     }
     let x = Ctx {
         c,
         db: &db,
-        agent: ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(300))
-            .build(),
+        agent: crate::ollama::agent(),
         url: format!("{}/api/generate", c.ollama_url),
     };
     let stop = Arc::new(AtomicBool::new(false));
