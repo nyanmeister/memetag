@@ -4,6 +4,10 @@ Memetag stores booru-style tags inside image and video files using XMP. Search, 
 
 
 
+Memetag is intended for **Linux**. The desktop browser uses OpenGL with X11 or
+Wayland; clipboard copying requires X11/XWayland. The CLI and web grid also work
+in Android's Termux; see [installation](docs/installation.md#phone-termux).
+
 The Rust workspace separates three executables:
 
 | Component | Purpose |
@@ -11,6 +15,17 @@ The Rust workspace separates three executables:
 | `memetag` | CLI, local indexing/search, safe metadata writes, OCR and file-server workers |
 | `memetag-gui` | Optional browser, editor and library-folder menu |
 | `memetag-infer` | Optional CLIP image-vector generation, with ONNX isolated here |
+
+Dependencies:
+
+- **Building:** stable Rust and a C compiler/linker; desktop builds also need
+  the graphics/input libraries listed in [installation](docs/installation.md#build-components).
+  Cargo installs the Rust dependencies from `Cargo.toml` and `Cargo.lock`.
+- **Opening originals:** install `feh` for still images and `mpv` for videos,
+  GIFs, animated PNG and animated WebP. These programs must be on PATH.
+- **Video previews and AVIF:** install FFmpeg (including `ffprobe`).
+- **Optional OCR:** install Tesseract with language data, or configure an Ollama
+  server with a suitable vision model. Reading saved OCR needs neither engine.
 
 ```sh
 cargo build --locked --release -p memetag -p memetag-gui

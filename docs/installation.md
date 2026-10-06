@@ -6,7 +6,18 @@ SQLite index and thumbnails stay local. OCR and image inference are optional.
 
 ## Build components
 
-With stable Rust and a C compiler:
+Install stable Rust and a C compiler/linker. Desktop builds also need OpenGL,
+X11/Wayland and xkbcommon libraries at runtime; install your distribution's
+development packages and `pkg-config` where required. Building the optional
+inference helper needs OpenSSL development libraries for its native TLS setup.
+The [CI workflow](../.github/workflows/ci.yml) lists the packages used for Ubuntu
+builds; [packaging/PKGBUILD](../packaging/PKGBUILD) lists Arch package dependencies.
+
+Rust dependencies are declared in the workspace's `Cargo.toml` files and pinned
+by `Cargo.lock`; Cargo downloads them when building. SQLite is compiled into the
+program, so a separate SQLite server or installation is not required.
+
+Choose the components you need:
 
 ```sh
 cargo build --locked --release -p memetag                 # CLI / server helpers
@@ -148,11 +159,26 @@ index and cache deliberately. A malformed folder configuration fails closed.
 
 ## Optional programs
 
-- ffmpeg/ffprobe: video information, previews and AVIF; ffmpegthumbnailer is optional.
-- feh and mpv: original still-image and animated/video viewers.
-- tesseract or an Ollama server: OCR. Speech/translation commands and models are configured separately.
-- fontconfig and an installed CJK font: international caption fallback.
-- systemd user units: optional resumable OCR and periodic pulls.
+Install these separately for the corresponding features. External viewers and
+local command-line tools must be available on PATH; Cargo does not install them.
+
+| Dependency | Used for |
+|---|---|
+| `feh` | Opening original still images from the desktop browser |
+| `mpv` | Opening original videos, GIFs, animated PNG and animated WebP |
+| FFmpeg (`ffmpeg` and `ffprobe`) | Video information, previews and AVIF decoding |
+| `ffmpegthumbnailer` | Optional alternative video thumbnail generator |
+| Tesseract with language data | Local OCR; the current command uses English (`eng`) data |
+| Ollama server with a vision model | Alternative OCR engine; configure its URL and model |
+| OpenSSH client; SSH access and the CLI on the file server | Network-source scans and metadata writes |
+| Fontconfig (`fc-match`) and an installed CJK font | International caption fallback |
+| systemd user units | Optional resumable OCR and periodic pulls |
+
+`feh` and `mpv` are required for their respective **Open original** actions;
+tagging, indexing and searching do not require them. Existing embedded or indexed
+OCR remains searchable without Tesseract or Ollama. Speech/translation commands
+and their models are configured separately. Run `memetag doctor` to report paths
+and detect available optional programs.
 
 ## File servers
 
