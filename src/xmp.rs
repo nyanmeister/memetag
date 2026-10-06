@@ -50,12 +50,12 @@ pub fn init() {
         write = Some(v);
     }
     if let Ok(v) = std::env::var("MEMETAG_LEGACY_XMP_NAMESPACES") {
-        legacy.extend(
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-        );
+        legacy = v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
     }
     configure(write, legacy);
 }
