@@ -1,0 +1,11 @@
+# Example vocabulary. Aliases normalize tag spellings; implications add broader
+# searchable tags without writing them into media. Edit with the Implications card.
+[aliases]
+"thisisfine" = "this is fine"
+"dog in burning room" = "this is fine"
+"lol" = "reaction:laugh"
+
+[implications]
+"cat" = ["animal"]
+"dog" = ["animal"]
+"this is fine" = ["reaction:resignation"]

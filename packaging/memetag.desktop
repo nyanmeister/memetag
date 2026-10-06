@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Memetag
+Comment=Browse images and videos by embedded tags
+Exec=memetag grab
+Icon=memetag
+Terminal=false
+Categories=Graphics;Viewer;
+Keywords=meme;tag;image;video;
+Actions=Folders;
+
+[Desktop Action Folders]
+Name=Library folders
+Exec=memetag folders menu

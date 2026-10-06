@@ -1,0 +1,27 @@
+# Example collection settings; prefer `memetag init /absolute/path/to/collection`.
+root = "/absolute/path/to/collection"
+# Video previews: frames sampled per clip and maximum playback rate.
+preview_fps = 12      # ceiling; each tile plays at its own natural rate (frames ÷ duration), capped here
+strip_frames = 24     # sampled frames per animated preview
+texture_budget_mb = 256  # thumbnail textures; increase for larger graphics-memory budgets
+
+# XMP namespace for memetag's own properties (meme:id, meme:text, ...). Every writer of a collection
+# must use the same one; the default is fine unless your files already carry another. Files written
+# under a namespace listed as legacy are read as memetag's and move to xmp_namespace on their next write.
+# xmp_namespace = "https://github.com/nyanmeister/memetag/ns/meme/1.0/"
+# legacy_xmp_namespaces = ["https://old.example/ns/meme/1.0/"]
+
+# File-server setup (optional). When enabled, `root` above and both local_root
+# values must name the same absolute mount path. These commands run on the server.
+# Imported into main on first sources.toml creation; afterwards use Folders'
+# Server settings. Add further shares using Network source or sources add-network.
+# [pull_remote]
+# local_root = "/mnt/memes"
+# root = "/srv/memes"
+# host = "user@fileserver"
+# command = "nice -n 19 ionice -c 3 memetag _pull-worker"
+# [batch_remote]
+# local_root = "/mnt/memes"
+# root = "/srv/memes"
+# host = "user@fileserver"
+# command = "nice -n 19 ionice -c 3 memetag _batch-worker"

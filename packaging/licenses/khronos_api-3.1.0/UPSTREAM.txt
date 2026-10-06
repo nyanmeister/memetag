@@ -1,0 +1,2 @@
+Upstream repository: https://github.com/brendanzab/gl-rs
+Revision from Cargo crate .cargo_vcs_info.json: f150967b1c44ae888e6676f93f639ebc82771bdc

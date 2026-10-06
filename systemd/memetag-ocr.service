@@ -1,0 +1,16 @@
+[Unit]
+Description=memetag OCR pass over the meme collection (resumable; stop any time, start again later)
+Wants=ollama.service
+After=ollama.service
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/memetag ocr
+# SIGTERM → memetag finishes the image in flight, commits, prints a summary, exits 0
+KillSignal=SIGTERM
+TimeoutStopSec=120
+# Keep background OCR at low CPU and I/O priority.
+Nice=19
+IOSchedulingClass=idle
+# exit code 0 when done or stopped; a non-zero exit (share dead, ollama down) is left for you to read in the journal
+Restart=no

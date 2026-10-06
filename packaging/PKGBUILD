@@ -1,0 +1,67 @@
+# shellcheck shell=bash
+# makepkg provides these variables; this recipe consumes a local committed source archive.
+# shellcheck disable=SC2034,SC2154
+pkgbase=memetag
+pkgname=('memetag' 'memetag-gui' 'memetag-infer')
+pkgver=0.3.1
+pkgrel=1
+pkgdesc='Embedded image/video tags, local search and an optional browser'
+arch=('x86_64')
+license=('GPL-3.0-or-later')
+makedepends=('rust' 'pkgconf' 'openssl' 'jq' 'ripgrep')
+source=("memetag-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/memetag-$pkgver" || return
+    cargo build --locked --release --workspace
+    tools/package.sh full "$srcdir/bundles" --no-build
+    mkdir -p "$srcdir/notices"
+    tar -xzf "$srcdir/bundles/memetag-$pkgver-full-$(uname -m)-linux.tar.gz" --strip-components=1 -C "$srcdir/notices"
+
+}
+check() {
+    cd "$srcdir/memetag-$pkgver" || return
+    cargo test --locked --release --workspace
+    "${CARGO_TARGET_DIR:-target}"/release/memetag --version
+    "${CARGO_TARGET_DIR:-target}"/release/memetag-gui --version
+    "${CARGO_TARGET_DIR:-target}"/release/memetag-infer --version
+}
+package_memetag() {
+    depends=('gcc-libs' 'glibc')
+    optdepends=('memetag-gui: browser and folder menu' 'memetag-infer: new image embeddings' 'ffmpeg: video previews and AVIF' 'tesseract: local OCR' 'openssh: file-server helpers')
+    cd "$srcdir/memetag-$pkgver" || return
+    install -Dm755 "${CARGO_TARGET_DIR:-target}"/release/memetag "$pkgdir/usr/bin/memetag"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/memetag/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/memetag/README.md"
+    install -Dm644 docs/installation.md "$pkgdir/usr/share/doc/memetag/installation.md"
+    install -Dm644 docs/network-sources.md "$pkgdir/usr/share/doc/memetag/network-sources.md"
+    install -Dm644 docs/concurrency.md "$pkgdir/usr/share/doc/memetag/concurrency.md"
+    install -Dm644 config/config.toml.example "$pkgdir/usr/share/memetag/config.toml.example"
+    # Optional units point at the packaged binary; activation is always manual.
+    install -Dm644 systemd/memetag-pull.service "$pkgdir/usr/lib/systemd/user/memetag-pull.service"
+    install -Dm644 systemd/memetag-pull.timer "$pkgdir/usr/lib/systemd/user/memetag-pull.timer"
+    install -Dm644 systemd/memetag-ocr.service "$pkgdir/usr/lib/systemd/user/memetag-ocr.service"
+    sed -i 's|%h/.local/bin/memetag|/usr/bin/memetag|' "$pkgdir/usr/lib/systemd/user/memetag-pull.service" "$pkgdir/usr/lib/systemd/user/memetag-ocr.service"
+    install -d "$pkgdir/usr/share/doc/memetag"
+    cp -R --preserve=mode,timestamps "$srcdir/notices/share/doc/memetag/licenses" "$pkgdir/usr/share/doc/memetag/"
+    install -m644 "$srcdir/notices/share/doc/memetag/dependency-licenses.tsv" "$pkgdir/usr/share/doc/memetag/"
+
+}
+package_memetag-gui() {
+    pkgdesc='Memetag optional browser and folder menu'
+    depends=("memetag=$pkgver" 'libglvnd' 'libxkbcommon' 'libx11' 'libxcursor' 'libxi' 'libxrandr' 'wayland')
+    optdepends=('feh: still-image viewer' 'mpv: video and animated-image viewer' 'fontconfig: international fallback fonts')
+    cd "$srcdir/memetag-$pkgver" || return
+    install -Dm755 "${CARGO_TARGET_DIR:-target}"/release/memetag-gui "$pkgdir/usr/bin/memetag-gui"
+    install -Dm644 packaging/memetag.desktop "$pkgdir/usr/share/applications/memetag.desktop"
+    install -Dm644 packaging/memetag.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/memetag.svg"
+}
+package_memetag-infer() {
+    pkgdesc='Memetag optional CPU image inference helper (model downloaded separately)'
+    depends=("memetag=$pkgver" 'gcc-libs' 'glibc')
+    cd "$srcdir/memetag-$pkgver" || return
+    install -Dm755 "${CARGO_TARGET_DIR:-target}"/release/memetag-infer "$pkgdir/usr/bin/memetag-infer"
+    install -Dm644 packaging/licenses/onnxruntime-1.28.0/LICENSE "$pkgdir/usr/share/licenses/memetag-infer/onnxruntime-LICENSE"
+    install -Dm644 packaging/licenses/onnxruntime-1.28.0/ThirdPartyNotices.txt "$pkgdir/usr/share/licenses/memetag-infer/onnxruntime-ThirdPartyNotices.txt"
+}

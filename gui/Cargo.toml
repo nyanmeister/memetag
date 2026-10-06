@@ -1,0 +1,9 @@
+[package]
+name = "memetag-gui"
+version = "0.3.1"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[dependencies]
+memetag = { path = "..", features = ["gui"] }

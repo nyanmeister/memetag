@@ -1,0 +1,43 @@
+[package]
+name = "memetag"
+version = "0.3.1"
+publish = false
+license = "GPL-3.0-or-later"
+edition = "2021"
+description = "Booru-style tags stored inside meme files (XMP), with a derpibooru-grammar search and a clickable grab"
+
+[workspace]
+members = ["gui", "infer"]
+default-members = [".", "gui"]
+resolver = "2"
+
+[features]
+default = []
+gui = ["dep:eframe", "dep:egui"]
+
+[dependencies]
+x11rb = "0.13"
+libc = "0.2"
+img-parts = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+sha2 = "0.10"
+hex = "0.4"
+rusqlite = { version = "0.40", features = ["bundled"] }
+quick-xml = "0.42"
+walkdir = "2"
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+eframe = { optional = true, version = "0.36", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+egui = { version = "0.36", optional = true }
+image_hasher = "3"
+ureq = { version = "2", features = ["json"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }  # mtimes cross ssh as JSON floats and are compared bit-for-bit (pull); the default parser can land an ulp off
+base64 = "0.22"
+ctrlc = { version = "3", features = ["termination"] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = true

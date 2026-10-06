@@ -1,0 +1,32 @@
+name: Rust checks and local release artifacts
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Native build and test dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libxkbcommon-dev libgl1-mesa-dev ffmpeg shellcheck jq ripgrep
+      - name: Rust tools
+        run: rustup update stable && rustup override set stable && rustup component add rustfmt clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Core checks
+        run: cargo test --locked -p memetag
+      - name: Desktop checks
+        run: cargo test --locked -p memetag --features gui
+      - name: Workspace lint
+        run: cargo clippy --locked --workspace --all-targets
+      - name: Shell lint
+        run: shellcheck tools/package.sh packaging/PKGBUILD
+      - name: Build desktop archive
+        run: tools/package.sh desktop dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memetag-desktop-linux
+          path: dist/

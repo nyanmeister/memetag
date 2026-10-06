@@ -1,0 +1,13 @@
+[Unit]
+Description=memetag pull, daily
+
+[Timer]
+# Example daily schedule in local time. Choose a quiet hour, then daemon-reload.
+# Persistent catches up after the computer was off.
+OnCalendar=*-*-* 11:00:00
+Persistent=true
+RandomizedDelaySec=10min
+Unit=memetag-pull.service
+
+[Install]
+WantedBy=timers.target

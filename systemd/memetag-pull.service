@@ -1,0 +1,13 @@
+[Unit]
+Description=memetag pull: merge new/changed/gone files from the configured server into the desktop index, then OCR what is new
+# The OCR pass writes the same index. ExecCondition skips this run cleanly (no failure) while it is active;
+# memetag pull refuses on its own too, as a second line of defence.
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c '! systemctl --user is-active --quiet memetag-ocr.service'
+# --start-ocr: start the resumable pass only if this run wrote new rows, so a quiet night leaves the GPU alone
+ExecStart=%h/.local/bin/memetag pull --start-ocr
+# Scans run on configured file servers; index merging, thumbnails and logging run here.
+Nice=19
+IOSchedulingClass=idle
