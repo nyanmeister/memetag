@@ -32,7 +32,8 @@ pub const UNTAGGED: egui::Color32 = egui::Color32::from_rgb(255, 140, 0);
 pub const THIN: egui::Color32 = egui::Color32::from_rgb(235, 210, 60);
 
 /// Keyboard contract for a list of suggestions under a text field: Up/Down move through `len` of them, Tab takes the
-/// current one. Only while `field` has focus and no modifier is held, so Shift+Tab and Ctrl+arrows keep their meaning.
+/// current one (and `TagInput` then moves on to the next field). Only while `field` has focus and no modifier is
+/// held, so Shift+Tab and Ctrl+arrows keep their meaning.
 pub fn choose(ui: &egui::Ui, field: egui::Id, len: usize, selected: &mut usize) -> Option<usize> {
     if len == 0 || !ui.memory(|m| m.has_focus(field)) {
         return None;
@@ -91,6 +92,43 @@ pub struct TagInput {
     pub text: String,
     selected: usize,
     primary: crate::xsel::Primary,
+    /// Set by `focus`: frames left in which `show` asks for the keyboard. Frames carrying the click that opened
+    /// the card do not count: egui's per-widget interaction in such a frame sees a click away from the focused
+    /// field and surrenders the focus again (traced 2026-10-07 on the Tags card; the Implications card only
+    /// escaped by timing). A new Window's first pass is also a sizing pass, so one request is never enough.
+    focus_frames: u8,
+    /// The field's widget id once shown, so `tab_chain` can hand it the keyboard.
+    field: Option<egui::Id>,
+    /// Tab (or Shift+Tab) pressed in this field this frame with no suggestion to take; read by `tab_chain`.
+    tab: Option<Tab>,
+}
+/// A pointer press, click or release is in this frame's input: a focus request made now is undone by egui's own
+/// "clicked elsewhere" rule, so `TagInput::focus` and the Tags card's Find field wait for the next frame.
+pub fn clicking(ui: &egui::Ui) -> bool {
+    ui.input(|i| i.pointer.any_pressed() || i.pointer.any_click() || i.pointer.any_released())
+}
+/// Which way a Tab press in a `TagInput` wants to go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tab {
+    Next,
+    Previous,
+}
+/// Tab in any of these fields moves the keyboard to the next one, Shift+Tab to the previous, wrapping at the ends
+/// (asked 2026-10-07: "have the tab key go to the next text field"). Without this egui's Tab lands on the
+/// field's own button first. Call after every field in the chain has been shown this frame.
+pub fn tab_chain(ui: &egui::Ui, inputs: &mut [&mut TagInput]) {
+    let n = inputs.len();
+    for i in 0..n {
+        let Some(dir) = inputs[i].tab() else { continue };
+        let j = match dir {
+            Tab::Next => (i + 1) % n,
+            Tab::Previous => (i + n - 1) % n,
+        };
+        if let Some(id) = inputs[j].field {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        return;
+    }
 }
 /// Autocomplete hits with the ones already in the field moved to the end and flagged `true`. A tag you have keeps its
 /// place in the list but sits below the ones you don't, dimmed. Stable within each
@@ -106,6 +144,16 @@ fn order(matches: Vec<String>, present: &BTreeSet<String>) -> Vec<(String, bool)
 }
 
 impl TagInput {
+    /// Give the field the keyboard the next time it is shown, so a card opens ready to type into (asked
+    /// 2026-10-07, for the editor: one click less per file).
+    pub fn focus(&mut self) {
+        self.focus_frames = 4;
+    }
+    /// A Tab pressed in this field this frame that no suggestion took; taken once. A caller with a single field
+    /// hands the keyboard on by itself, several fields go through `tab_chain`.
+    pub fn tab(&mut self) -> Option<Tab> {
+        self.tab.take()
+    }
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -115,9 +163,36 @@ impl TagInput {
         present: &BTreeSet<String>,
     ) -> Option<String> {
         let field = ui.make_persistent_id(id);
+        if self.focus_frames > 0 && !clicking(ui) {
+            self.focus_frames -= 1;
+            if ui.memory(|m| m.had_focus_last_frame(field) && m.has_focus(field)) {
+                self.focus_frames = 0; // it took
+            } else {
+                ui.memory_mut(|m| m.request_focus(field));
+            }
+        }
         let before = order(autocomplete::matches(suggestions, &self.text), present);
         let mut chosen =
             choose(ui, field, before.len(), &mut self.selected).map(|k| before[k].0.clone());
+        // Tab commits what is in the field (the chosen suggestion, else the typed text) and moves to the next field;
+        // Enter commits and stays, for stacking several tags in one field. A Tab that `choose` left is taken here
+        // before the text field could see it; the field's lock_focus keeps egui's own Tab-to-next-widget out of it.
+        self.tab = None;
+        self.field = Some(field);
+        if chosen.is_some() {
+            self.tab = Some(Tab::Next);
+        } else if ui.is_enabled() && ui.memory(|m| m.has_focus(field)) {
+            ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+                    self.tab = Some(Tab::Previous);
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                    self.tab = Some(Tab::Next);
+                }
+            });
+            if self.tab.is_some() && !self.text.trim().is_empty() {
+                chosen = Some(self.text.clone());
+            }
+        }
         // egui drops focus at the start of the frame Escape arrives in, so "had it last frame" is the test that sees it
         if ui.is_enabled()
             && !self.text.is_empty()
@@ -133,7 +208,7 @@ impl TagInput {
         ui.horizontal(|ui| {
             let mut out = egui::TextEdit::singleline(&mut self.text)
                 .id(field)
-                .lock_focus(!before.is_empty())
+                .lock_focus(true) // Tab is ours (a suggestion, or the next field), never egui's focus walk
                 .hint_text("Type a tag…")
                 .desired_width(350.0)
                 .show(ui);
@@ -165,7 +240,7 @@ impl TagInput {
         let hits = order(autocomplete::matches(suggestions, &self.text), present);
         if !hits.is_empty() {
             ui.small(
-                "Up/Down choose · Tab accepts · Enter or a comma adds what you typed · Esc clears",
+                "Up/Down choose · Tab takes it and moves on · Enter or a comma adds what you typed · Esc clears",
             );
         }
         for (i, (tag, here)) in hits.iter().enumerate() {

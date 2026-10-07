@@ -44,6 +44,9 @@ pub struct TagsUi {
     deleting: Option<String>,
     error: Option<String>,
     closing: bool,
+    /// Frames left in which the Find field asks for the keyboard, so the card opens ready to type; counted the way
+    /// `TagInput::focus` counts (not on the click's frame, not on the sizing pass).
+    focus_filter: u8,
 }
 
 impl TagsUi {
@@ -51,6 +54,7 @@ impl TagsUi {
         let mut this = Self {
             counts: vec![],
             filter: String::new(),
+            focus_filter: 4,
             suggestions: vec![],
             renaming: None,
             to: TagInput::default(),
@@ -144,9 +148,21 @@ impl TagsUi {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Find");
+                    if self.focus_filter > 0 && !widgets::clicking(ui) {
+                        self.focus_filter -= 1;
+                        let id = ui.make_persistent_id("tags-filter");
+                        if ui.memory(|m| m.had_focus_last_frame(id) && m.has_focus(id)) {
+                            self.focus_filter = 0;
+                        } else {
+                            ui.memory_mut(|m| m.request_focus(id));
+                        }
+                    }
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .id_salt("tags-filter")
+                            // an explicit id: the field's own `id_salt` registers under another id than
+                            // make_persistent_id gives, and the focus request then dies on egui's dead-man's
+                            // switch (traced 2026-10-07)
+                            .id(ui.make_persistent_id("tags-filter"))
                             .desired_width(240.0)
                             .hint_text("part of a tag"),
                     );
@@ -184,6 +200,7 @@ impl TagsUi {
                             self.renaming = if self.renaming.as_deref() == Some(tag.as_str()) {
                                 None
                             } else {
+                                self.to.focus(); // the form opens with the keyboard in its field
                                 Some(tag.clone())
                             };
                         }

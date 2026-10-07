@@ -42,7 +42,7 @@ enum Msg {
     },
     OcrDone(HashSet<String>),
     Pulled(crate::pull::Outcome),
-    /// a vocab sync (a Save/rename push, or a grab's pull) found both sides changed: raise the resolve card
+    /// a vocab sync (an Implications Add or a Tags rename push, or a grab's pull) found both sides changed: raise the resolve card
     VocabConflict(crate::vocabsync::Conflict),
     /// a resolution finished on a worker thread: fold the new rules in (take-theirs, merge) or just report (keep-mine)
     VocabResolved(Result<crate::vocabconflict::Resolved, String>),
@@ -136,7 +136,7 @@ struct App {
     help_open: bool,
     ocr_help_open: bool,
     implications: Option<crate::implications::ImplicationsUi>,
-    /// The resolve card for a vocab sync conflict (both machines changed the rules): raised by a Save/rename push or a
+    /// The resolve card for a vocab sync conflict (both machines changed the rules): raised by an Implications Add or a Tags rename push or a
     /// grab's pull that found a divergence, closed when a choice has been applied.
     vocab_conflict: Option<crate::vocabconflict::VocabConflictUi>,
     tags_card: Option<crate::tags_card::TagsUi>,
@@ -432,23 +432,21 @@ impl App {
                     ctx,
                     vocab,
                     changed,
-                    format!("Implications saved; {n} files changed"),
-                    None,
+                    format!("Implications applied; {n} files changed"),
                 );
             }
         }
     }
-    /// A locally saved vocabulary (an Implications Save or a Tags rename): take the rules over, refresh what shows
-    /// them, then push them to the server so every machine gets the change (a conflict raises the resolve card).
+    /// A locally saved vocabulary (an Implications Add or remove, a Tags rename): take the rules over, refresh what
+    /// shows them, then push them to the server so every machine gets the change (a conflict raises the resolve card).
     fn apply_vocab(
         &mut self,
         ctx: &egui::Context,
         vocab: crate::vocab::Vocab,
         changed: Vec<(String, std::collections::BTreeSet<String>)>,
         message: String,
-        rename: Option<(&str, &str)>,
     ) {
-        self.absorb_vocab(vocab, changed, message, rename);
+        self.absorb_vocab(vocab, changed, message);
         self.push_vocab_async(ctx);
     }
     /// Fold a vocabulary and the rows `Db::reimply` changed into the open window, without pushing. Shared by the local
@@ -458,7 +456,6 @@ impl App {
         vocab: crate::vocab::Vocab,
         changed: Vec<(String, std::collections::BTreeSet<String>)>,
         message: String,
-        rename: Option<(&str, &str)>,
     ) {
         self.cfg.vocab = vocab;
         let by_path: HashMap<String, usize> = self
@@ -473,9 +470,8 @@ impl App {
             }
         }
         if let Some(im) = &mut self.implications {
-            // an open card holds its own copy of the rules: a rename saved behind its back must reach it, or its
-            // next Save writes the old rules over the new file (review, 2026-09-22)
-            im.follow(&self.cfg.vocab, rename);
+            // an open card shows its own copy of the rules; a rename or a pull behind its back must reach it
+            im.follow(&self.cfg.vocab);
             im.refresh(&self.rows);
         }
         self.search_complete = crate::search_complete::SearchComplete::new(&self.cfg, &self.rows);
@@ -549,7 +545,7 @@ impl App {
     }
     /// The files no longer carry `from`: update rules and aliases that mention it to say `to`. Reads vocab.toml afresh
     /// so rules edited by hand since the window opened survive, as the Implications card does; the file goes first,
-    /// then the index, the same order as that card's Save.
+    /// then the index, the same order as that card's Add.
     fn finish_rename(&mut self, ctx: &egui::Context, from: &str, to: &str) {
         let mut vocab = match &self.cfg.vocab.path {
             Some(p) => crate::vocab::Vocab::load(p),
@@ -590,7 +586,6 @@ impl App {
                     format!(
                         "Rules mentioning \"{from}\" now say \"{to}\"; {n} files changed{left}"
                     ),
-                    Some((from, to)),
                 );
             }
             Err(e) => {
@@ -809,7 +804,7 @@ impl App {
         })();
         match result {
             Ok((vocab, tags)) => {
-                self.absorb_vocab(vocab, tags, "Rules refreshed from the server".into(), None)
+                self.absorb_vocab(vocab, tags, "Rules refreshed from the server".into())
             }
             Err(e) => self.toast = Some((format!("Rules refresh failed: {e}"), Instant::now())),
         }

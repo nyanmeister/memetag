@@ -183,12 +183,15 @@ impl EditorUi {
             let _ = tx.send(result);
             ctx.request_repaint();
         });
+        // the tag field is the point of the card, so it has the keyboard as soon as the file is loaded
+        let mut input = crate::widgets::TagInput::default();
+        input.focus();
         Self {
             draft: None,
             load_rx: rx,
             save_rx: None,
             suggestions: vec![],
-            input: Default::default(),
+            input,
             error: None,
             discard: false,
             next: false,
@@ -346,13 +349,16 @@ impl EditorUi {
                     ui.strong("Tags");
                     crate::widgets::chips(ui, "", &mut draft.tags, |_| "Remove tag".into());
                     if let Some(tag) = self.input.show(ui, &self.suggestions, "edit-tag-input", "Add", &draft.tags) { draft.tags.insert(c.vocab.canon(&tag)); }
+                    // Tab: on to the text. The text box carries the same explicit id; its own id_salt would register
+                    // under another id and the request would die on egui's dead-man's switch (traced 2026-10-07)
+                    if self.input.tab() == Some(crate::widgets::Tab::Next) { ui.memory_mut(|m| m.request_focus(ui.make_persistent_id("edit-ocr-text"))); }
                     if !draft.inherited.is_empty() {
                         ui.collapsing("Tags from folders and implications", |ui| {
                             for (tag, source) in &draft.inherited { ui.label(format!("{tag} ({source})")); }
                         });
                     }
                     ui.separator(); ui.strong("OCR text");
-                    let mut out = egui::TextEdit::multiline(&mut draft.text).id_salt("edit-ocr-text").desired_rows(7).desired_width(f32::INFINITY).show(ui);
+                    let mut out = egui::TextEdit::multiline(&mut draft.text).id(ui.make_persistent_id("edit-ocr-text")).desired_rows(7).desired_width(f32::INFINITY).show(ui);
                     let pasted = self.primary.sync(ui, &mut out, &mut draft.text, true);
                     if out.response.changed() || pasted { draft.reviewed = true; }
                     if ui.checkbox(&mut draft.reviewed, "Human-reviewed — keep this text, even if empty").changed() && !draft.reviewed { draft.text = draft.machine.clone(); }

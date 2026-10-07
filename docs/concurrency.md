@@ -12,8 +12,9 @@ server copy, and a file write based on old bytes erased a completed tag write.
   upload fails its own checksum before replacement. Requires `sh`, `flock`, `mktemp`,
   `sha256sum` and standard file utilities on the SSH server.
 - Local sync and Save share a permanent `vocab.toml.lock`. They fail promptly when busy.
-  Saves compare the original bytes with the current file under that lock. A stale draft
-  stays unsaved: reopen the Implications card and reapply the intended change. Merge
+  Saves compare the original bytes with the current file under that lock. The Implications
+  card reads the file afresh for every Add or remove and applies at once (no draft since
+  2026-10-07); a write that loses the race leaves the fields filled for another Add. Merge
   refuses unresolved/stale alias choices and commits the server before replacing local
   rules; an upload failure leaves local rules and base unchanged. Disk/connection errors
   are still possible between the server, local rules and base writes; rerun sync to

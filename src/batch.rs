@@ -590,7 +590,11 @@ impl BatchUi {
             load_rx: rx,
             add: BTreeSet::new(),
             remove: BTreeSet::new(),
-            add_input: TagInput::default(),
+            add_input: {
+                let mut i = TagInput::default();
+                i.focus(); // the panel opens ready to type the first tag
+                i
+            },
             remove_input: TagInput::default(),
             rx: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -692,6 +696,7 @@ impl BatchUi {
                         ui.horizontal_wrapped(|ui| { ui.small("on every selected image:"); for t in shared { if ui.small_button(&t).on_hover_text("Put it in the Remove list").clicked() { self.add.remove(&t); self.remove.insert(t); } } });
                     }
                     if let Some(tag) = self.remove_input.show(ui, &loaded.suggestions, "batch-remove", "Add to list", &self.remove) { let tag = c.vocab.canon(&tag); if !tag.is_empty() { self.add.remove(&tag); self.remove.insert(tag); } }
+                    widgets::tab_chain(ui, &mut [&mut self.add_input, &mut self.remove_input]);
                     ui.collapsing("Existing embedded tags (indexed counts; click to remove)", |ui| {
                         for (tag, count) in &loaded.counts { if ui.button(format!("{tag} — {count} / {}", self.paths.len())).clicked() { self.add.remove(tag); self.remove.insert(tag.clone()); } }
                     });
