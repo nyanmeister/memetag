@@ -348,17 +348,26 @@ impl EditorUi {
                     }
                     ui.strong("Tags");
                     crate::widgets::chips(ui, "", &mut draft.tags, |_| "Remove tag".into());
+                    let tag_field = ui.make_persistent_id("edit-tag-input");
+                    let ocr_field = ui.make_persistent_id("edit-ocr-text");
+                    // Both Tab directions cycle between text fields, skipping chips, disclosure rows and buttons.
+                    // OCR captures Tab so egui cannot move focus before we consume the key or insert indentation.
+                    if ui.is_enabled() && ui.memory(|m| m.has_focus(ocr_field)) && ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)
+                            || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                    }) { ui.memory_mut(|m| {
+                        m.move_focus(egui::FocusDirection::None);
+                        m.request_focus(tag_field);
+                    }); }
                     if let Some(tag) = self.input.show(ui, &self.suggestions, "edit-tag-input", "Add", &draft.tags) { draft.tags.insert(c.vocab.canon(&tag)); }
-                    // Tab: on to the text. The text box carries the same explicit id; its own id_salt would register
-                    // under another id and the request would die on egui's dead-man's switch (traced 2026-10-07)
-                    if self.input.tab() == Some(crate::widgets::Tab::Next) { ui.memory_mut(|m| m.request_focus(ui.make_persistent_id("edit-ocr-text"))); }
+                    if self.input.tab().is_some() { ui.memory_mut(|m| m.request_focus(ocr_field)); }
                     if !draft.inherited.is_empty() {
                         ui.collapsing("Tags from folders and implications", |ui| {
                             for (tag, source) in &draft.inherited { ui.label(format!("{tag} ({source})")); }
                         });
                     }
                     ui.separator(); ui.strong("OCR text");
-                    let mut out = egui::TextEdit::multiline(&mut draft.text).id(ui.make_persistent_id("edit-ocr-text")).desired_rows(7).desired_width(f32::INFINITY).show(ui);
+                    let mut out = egui::TextEdit::multiline(&mut draft.text).id(ocr_field).lock_focus(true).desired_rows(7).desired_width(f32::INFINITY).show(ui);
                     let pasted = self.primary.sync(ui, &mut out, &mut draft.text, true);
                     if out.response.changed() || pasted { draft.reviewed = true; }
                     if ui.checkbox(&mut draft.reviewed, "Human-reviewed — keep this text, even if empty").changed() && !draft.reviewed { draft.text = draft.machine.clone(); }
@@ -420,6 +429,99 @@ mod tests {
     use std::fs::{self, FileTimes};
     use std::os::unix::fs::MetadataExt;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn tab_cycles_between_editor_text_fields_without_changing_ocr() {
+        let c = Cfg::for_tests(&std::env::temp_dir().join("memetag-editor-focus"));
+        let ctx = egui::Context::default();
+        let (_, load_rx) = mpsc::channel();
+        let mut input = crate::widgets::TagInput::default();
+        input.focus();
+        let mut editor = EditorUi {
+            draft: Some(Draft {
+                path: "example.png".into(),
+                mtime: 0.0,
+                tags: BTreeSet::new(),
+                inherited: vec![("folder:examples".into(), "folder".into())],
+                text: "OCR caption".into(),
+                original_text: "OCR caption".into(),
+                machine: "OCR caption".into(),
+                reviewed: false,
+                originally_reviewed: false,
+                original_tags: BTreeSet::new(),
+                revision: vec![],
+            }),
+            load_rx,
+            save_rx: None,
+            suggestions: vec![],
+            input,
+            error: None,
+            discard: false,
+            next: false,
+            skip: false,
+            primary: Default::default(),
+        };
+        let mut frame = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    assert!(matches!(editor.show(ui, &c, None), Action::None));
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+        let tab = |modifiers| {
+            vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ]
+        };
+        for _ in 0..5 {
+            frame(vec![]);
+        }
+        let tags = ctx.memory(|m| m.focused()).unwrap();
+        frame(tab(egui::Modifiers::NONE));
+        let ocr = ctx.memory(|m| m.focused()).unwrap();
+        assert_ne!(tags, ocr);
+        frame(tab(egui::Modifiers::SHIFT));
+        assert!(
+            ctx.memory(|m| m.has_focus(tags)),
+            "Shift+Tab returns to tags"
+        );
+        frame(vec![]);
+        assert!(ctx.memory(|m| m.has_focus(tags)), "focus persists");
+        frame(tab(egui::Modifiers::NONE));
+        assert!(ctx.memory(|m| m.has_focus(ocr)));
+        frame(tab(egui::Modifiers::NONE));
+        assert!(ctx.memory(|m| m.has_focus(tags)), "Tab wraps from OCR");
+        frame(vec![]);
+        assert!(ctx.memory(|m| m.has_focus(tags)));
+        frame(tab(egui::Modifiers::SHIFT));
+        assert!(
+            ctx.memory(|m| m.has_focus(ocr)),
+            "Shift+Tab wraps from tags"
+        );
+        frame(vec![]);
+        assert!(ctx.memory(|m| m.has_focus(ocr)));
+        let draft = editor.draft.unwrap();
+        assert_eq!(draft.text, "OCR caption");
+        assert!(!draft.reviewed, "navigation must not mark OCR as edited");
+    }
+
     #[test]
     fn edits_preserve_file_and_override_an_old_ocr_worker() {
         let root = std::env::temp_dir().join(format!("memetag-editor-{}", std::process::id()));
