@@ -32,7 +32,7 @@ pub const UNTAGGED: egui::Color32 = egui::Color32::from_rgb(255, 140, 0);
 pub const THIN: egui::Color32 = egui::Color32::from_rgb(235, 210, 60);
 
 /// Keyboard contract for a list of suggestions under a text field: Up/Down move through `len` of them, Tab takes the
-/// current one (and `TagInput` then moves on to the next field). Only while `field` has focus and no modifier is
+/// current one. Only while `field` has focus and no modifier is
 /// held, so Shift+Tab and Ctrl+arrows keep their meaning.
 pub fn choose(ui: &egui::Ui, field: egui::Id, len: usize, selected: &mut usize) -> Option<usize> {
     if len == 0 || !ui.memory(|m| m.has_focus(field)) {
@@ -99,7 +99,7 @@ pub struct TagInput {
     focus_frames: u8,
     /// The field's widget id once shown, so `tab_chain` can hand it the keyboard.
     field: Option<egui::Id>,
-    /// Tab (or Shift+Tab) pressed in this field this frame with no suggestion to take; read by `tab_chain`.
+    /// Tab (or Shift+Tab) pressed while this field was empty; read by `tab_chain`.
     tab: Option<Tab>,
 }
 /// A pointer press, click or release is in this frame's input: a focus request made now is undone by egui's own
@@ -113,7 +113,7 @@ pub enum Tab {
     Next,
     Previous,
 }
-/// Tab in any of these fields moves the keyboard to the next one, Shift+Tab to the previous, wrapping at the ends
+/// Tab in an empty field moves the keyboard to the next one, Shift+Tab to the previous, wrapping at the ends
 /// (asked 2026-10-07: "have the tab key go to the next text field"). Without this egui's Tab lands on the
 /// field's own button first. Call after every field in the chain has been shown this frame.
 pub fn tab_chain(ui: &egui::Ui, inputs: &mut [&mut TagInput]) {
@@ -149,7 +149,7 @@ impl TagInput {
     pub fn focus(&mut self) {
         self.focus_frames = 4;
     }
-    /// A Tab pressed in this field this frame that no suggestion took; taken once. A caller with a single field
+    /// A Tab pressed while this field was empty; taken once. A caller with a single field
     /// hands the keyboard on by itself, several fields go through `tab_chain`.
     pub fn tab(&mut self) -> Option<Tab> {
         self.tab.take()
@@ -172,26 +172,31 @@ impl TagInput {
             }
         }
         let before = order(autocomplete::matches(suggestions, &self.text), present);
-        let mut chosen =
-            choose(ui, field, before.len(), &mut self.selected).map(|k| before[k].0.clone());
-        // Tab commits what is in the field (the chosen suggestion, else the typed text) and moves to the next field;
-        // Enter commits and stays, for stacking several tags in one field. A Tab that `choose` left is taken here
-        // before the text field could see it; the field's lock_focus keeps egui's own Tab-to-next-widget out of it.
+        let empty = self.text.trim().is_empty();
+        let mut chosen = if ui.is_enabled() && !empty {
+            choose(ui, field, before.len(), &mut self.selected).map(|k| before[k].0.clone())
+        } else {
+            None
+        };
+        // Tab completes or commits text and stays here, for stacking several tags. Only a field that was empty
+        // before this key press hands focus on; clearing it after a completion must not also move focus.
+        // Consume navigation before TextEdit sees it; lock_focus keeps egui's own focus walk out of it.
         self.tab = None;
         self.field = Some(field);
-        if chosen.is_some() {
-            self.tab = Some(Tab::Next);
-        } else if ui.is_enabled() && ui.memory(|m| m.has_focus(field)) {
+        if chosen.is_none() && ui.is_enabled() && ui.memory(|m| m.has_focus(field)) {
             ui.input_mut(|i| {
                 if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
-                    self.tab = Some(Tab::Previous);
+                    if empty {
+                        self.tab = Some(Tab::Previous);
+                    }
                 } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                    self.tab = Some(Tab::Next);
+                    if empty {
+                        self.tab = Some(Tab::Next);
+                    } else {
+                        chosen = Some(self.text.clone());
+                    }
                 }
             });
-            if self.tab.is_some() && !self.text.trim().is_empty() {
-                chosen = Some(self.text.clone());
-            }
         }
         // egui drops focus at the start of the frame Escape arrives in, so "had it last frame" is the test that sees it
         if ui.is_enabled()
@@ -240,7 +245,7 @@ impl TagInput {
         let hits = order(autocomplete::matches(suggestions, &self.text), present);
         if !hits.is_empty() {
             ui.small(
-                "Up/Down choose · Tab takes it and moves on · Enter or a comma adds what you typed · Esc clears",
+                "Up/Down choose · Tab takes it · Enter or a comma adds what you typed · Empty field: Tab moves on · Esc clears",
             );
         }
         for (i, (tag, here)) in hits.iter().enumerate() {
@@ -383,6 +388,96 @@ mod tests {
             events,
             ..Default::default()
         });
+    }
+
+    fn tag_frame(
+        ctx: &egui::Context,
+        inputs: &mut [TagInput; 2],
+        mut events: Vec<egui::Event>,
+    ) -> [Option<String>; 2] {
+        let modifiers = events
+            .iter()
+            .find_map(|event| match event {
+                egui::Event::Key { modifiers, .. } => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or_default();
+        events.insert(0, egui::Event::ModifiersChanged(modifiers));
+        frame(ctx, events);
+        let mut tags = [None, None];
+        egui::Area::new(egui::Id::new("tag-test")).show(ctx, |ui| {
+            for (i, input) in inputs.iter_mut().enumerate() {
+                tags[i] = input.show(
+                    ui,
+                    &[("cat".into(), 1, false)],
+                    &format!("tag-{i}"),
+                    "Use",
+                    &BTreeSet::new(),
+                );
+            }
+            let [first, second] = inputs;
+            tab_chain(ui, &mut [first, second]);
+        });
+        ctx.end_pass().textures_delta.clear();
+        tags
+    }
+
+    fn tag_key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn tag_completion_and_literal_commits_keep_focus() {
+        for (text, key, expected) in [
+            ("ca", egui::Key::Tab, "cat"),
+            ("new-tag", egui::Key::Tab, "new-tag"),
+            ("ca", egui::Key::Enter, "ca"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut inputs = [TagInput::default(), TagInput::default()];
+            inputs[0].focus();
+            for _ in 0..5 {
+                tag_frame(&ctx, &mut inputs, vec![]);
+            }
+            let field = inputs[0].field.unwrap();
+            inputs[0].text = text.into();
+            let tags = tag_frame(&ctx, &mut inputs, vec![tag_key(key, egui::Modifiers::NONE)]);
+            assert_eq!(tags, [Some(expected.into()), None]);
+            assert!(inputs[0].text.is_empty());
+            assert!(ctx.memory(|m| m.has_focus(field)), "{text}: {key:?}");
+            tag_frame(&ctx, &mut inputs, vec![]);
+            assert!(ctx.memory(|m| m.has_focus(field)), "focus persists");
+        }
+    }
+
+    #[test]
+    fn tag_tab_navigation_requires_an_empty_field() {
+        for (text, modifiers, moves) in [
+            ("", egui::Modifiers::NONE, true),
+            ("", egui::Modifiers::SHIFT, true),
+            ("  ", egui::Modifiers::NONE, true),
+            ("ca", egui::Modifiers::SHIFT, false),
+            ("new-tag", egui::Modifiers::SHIFT, false),
+        ] {
+            let ctx = egui::Context::default();
+            let mut inputs = [TagInput::default(), TagInput::default()];
+            inputs[0].focus();
+            for _ in 0..5 {
+                tag_frame(&ctx, &mut inputs, vec![]);
+            }
+            inputs[0].text = text.into();
+            let tags = tag_frame(&ctx, &mut inputs, vec![tag_key(egui::Key::Tab, modifiers)]);
+            assert_eq!(tags, [None, None]);
+            assert_eq!(inputs[0].text, text);
+            let field = inputs[usize::from(moves)].field.unwrap();
+            assert!(ctx.memory(|m| m.has_focus(field)), "{text}: {modifiers:?}");
+        }
     }
 
     #[test]
