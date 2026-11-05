@@ -91,8 +91,13 @@ fn namespace_settings_override_and_migrate_without_losing_metadata() {
     let data = fs::read(&old).unwrap();
     let packet = containers::get_xmp(&data).unwrap().unwrap();
     assert!(packet.contains("foreign title"));
+    // the legacy declaration on rdf:Description became the write namespace; properties rely on it
     assert!(
-        packet.contains(&format!("<meme:id xmlns:meme=\"{DEFAULT_MEME}\">{id}")),
+        packet.contains(&format!("xmlns:meme=\"{DEFAULT_MEME}\"")) && !packet.contains(OLD),
+        "{packet}"
+    );
+    assert!(
+        packet.contains(&format!("<meme:id>{id}</meme:id>")),
         "{packet}"
     );
     assert!(!packet.contains(&format!("meme:id=\"{id}\"")));

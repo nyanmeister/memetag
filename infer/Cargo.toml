@@ -1,9 +1,9 @@
 [package]
 name = "memetag-infer"
-version = "0.3.1"
+version = "0.3.15"
 edition = "2021"
 publish = false
-license = "GPL-3.0-or-later"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 memetag = { path = ".." }

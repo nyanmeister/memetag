@@ -57,6 +57,227 @@ pub fn choose(ui: &egui::Ui, field: egui::Id, len: usize, selected: &mut usize) 
     chosen
 }
 
+/// The dark tint a category's chips wear: the vocabulary's `[colors]` entry or the built-in one
+/// (`Vocab::color_of`); a category with neither, or none at all, keeps the plain button fill (`None`).
+pub fn category_fill(vocab: &crate::vocab::Vocab, category: &str) -> Option<egui::Color32> {
+    vocab
+        .color_of(category)
+        .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+}
+
+/// WCAG relative luminance of a colour, 0 (black) to 1 (white): sRGB channels linearised, then the
+/// luminance weights.
+pub fn luminance(c: egui::Color32) -> f32 {
+    let lin = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+/// The text colours (strong, weak) that read on a fill (asked 2026-11-05: "if the category color is too bright
+/// for white text … make the text black instead, which lets us use white as a color"). Black beats white once
+/// the fill's luminance passes 0.179, where the two WCAG contrast ratios, (L+0.05)/0.05 and 1.05/(L+0.05), are
+/// equal; `None` (no tint) keeps the theme's own text colours.
+pub fn text_on(ui: &egui::Ui, fill: Option<egui::Color32>) -> (egui::Color32, egui::Color32) {
+    match fill {
+        Some(f) if luminance(f) > 0.179 => (egui::Color32::BLACK, egui::Color32::from_gray(70)),
+        Some(_) => (egui::Color32::from_gray(235), egui::Color32::from_gray(185)),
+        None => (
+            ui.visuals().widgets.inactive.text_color(),
+            ui.visuals().weak_text_color(),
+        ),
+    }
+}
+/// A button in a category's tint, its text black or light as the tint needs; no tint, a plain button.
+pub fn tinted_button(
+    ui: &egui::Ui,
+    label: &str,
+    fill: Option<egui::Color32>,
+) -> egui::Button<'static> {
+    let (strong, _) = text_on(ui, fill);
+    let mut b = egui::Button::new(egui::RichText::new(label).color(strong));
+    if let Some(f) = fill {
+        b = b.fill(f);
+    }
+    b
+}
+
+/// Draw only the rows of a long list that are in view, inside `ScrollArea::show_viewport`. Every row costs its
+/// widgets each frame in egui, and a card listing the whole vocabulary (3,551 tags on 2026-11-05) spent most of a
+/// core redrawing rows nobody could see. `heights[i]` is row i's height as last drawn (0 = never drawn yet, taken
+/// as the mean of the drawn ones, or `guess` before any is); rows above and below the view become one blank
+/// space each, so the scroll bar still spans the whole list. Rows draw under their own index as id, so a widget's
+/// state (an open menu, a focused field) stays with its row whatever is scrolled past.
+pub fn rows_in_view(
+    ui: &mut egui::Ui,
+    viewport: egui::Rect,
+    heights: &mut [f32],
+    guess: f32,
+    mut row: impl FnMut(&mut egui::Ui, usize),
+) {
+    let spacing = ui.spacing().item_spacing.y;
+    let (sum, n) = heights
+        .iter()
+        .filter(|h| **h > 0.0)
+        .fold((0.0, 0usize), |(s, n), h| (s + h, n + 1));
+    let typical = if n > 0 { sum / n as f32 } else { guess };
+    let mut y = 0.0;
+    let mut skipped = 0.0;
+    for (i, height) in heights.iter_mut().enumerate() {
+        let h = if *height > 0.0 { *height } else { typical };
+        if y + h < viewport.min.y || y > viewport.max.y {
+            skipped += h + spacing;
+        } else {
+            if skipped > 0.0 {
+                ui.add_space(skipped - spacing);
+                skipped = 0.0;
+            }
+            let drawn = ui.push_id(i, |ui| row(ui, i)).response.rect.height();
+            if drawn > 0.0 {
+                *height = drawn;
+            }
+        }
+        y += h + spacing;
+    }
+    if skipped > 0.0 {
+        ui.add_space(skipped - spacing);
+    }
+}
+
+/// One category's row of the editor: `show` are the tags of the file in this row (chips with ×, tinted with
+/// `fill`), `dim` the inherited ones shown after them without a ×.
+pub struct ChipRow<'a> {
+    pub label: &'a str,
+    pub show: &'a [String],
+    pub dim: &'a [String],
+    pub fill: Option<egui::Color32>,
+    /// The tint of any tag by its own category: a relational chip's modifier half wears its modifier's.
+    pub tint_of: &'a dyn Fn(&str) -> Option<egui::Color32>,
+}
+/// What a chip was clicked with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChipClick {
+    Primary,
+    Secondary,
+}
+/// Draw a `ChipRow` and say which chip was clicked, with which button; the caller decides what that means
+/// (removal, or the relation gesture). `armed` is the chip drawn as selected, the modifier waiting for its target.
+pub fn chip_row(
+    ui: &mut egui::Ui,
+    row: &ChipRow,
+    armed: Option<&str>,
+    hover: impl Fn(&str) -> String,
+) -> Option<(String, ChipClick)> {
+    let mut out = None;
+    ui.horizontal_wrapped(|ui| {
+        if !row.label.is_empty() {
+            ui.add_sized(
+                [76.0, 18.0],
+                egui::Label::new(egui::RichText::new(row.label).weak()).halign(egui::Align::LEFT),
+            )
+            .on_hover_text("Click a tag to remove it. Right-click one to relate it to another tag on this file; right-click the target next; left-click or Escape cancels. Categories are set in the Tags card.");
+        }
+        for t in row.show {
+            let r = match crate::vocab::relation(t) {
+                // a relation wears both categories: the modifier's tint, then the target's (mockup 2026-11-05, B)
+                Some((m, target)) => {
+                    let plain = ui.visuals().widgets.inactive.bg_fill;
+                    let left = (row.tint_of)(m).unwrap_or(plain);
+                    let right = row.fill.unwrap_or(plain);
+                    split_chip(ui, m, &format!("‹{target}› ×"), left, right, armed == Some(t.as_str()))
+                }
+                None => {
+                    let mut b = egui::Button::new(chip_text(ui, t, row.fill)).selected(armed == Some(t.as_str()));
+                    if let Some(f) = row.fill {
+                        b = b.fill(f);
+                    }
+                    ui.add(b)
+                }
+            };
+            let h = hover(t);
+            let r = if h.is_empty() { r } else { r.on_hover_text(h) };
+            if r.clicked() {
+                out = Some((t.clone(), ChipClick::Primary));
+            } else if r.secondary_clicked() {
+                out = Some((t.clone(), ChipClick::Secondary));
+            }
+        }
+        for t in row.dim {
+            ui.add_enabled(false, egui::Button::new(t.as_str()));
+        }
+    });
+    out
+}
+
+/// A relational chip, `modifier ‹target› ×` as one pill split at the seam between the words: the modifier's half
+/// in its category's tint, the target's in its own, each with the text colour its fill needs (mockup 2026-11-05,
+/// option B: "each word on its own tint"; asked with it: the pill fits the text and the words sit as close as a
+/// plain chip's). Sized and padded like a `Button`, so it lines up with the chips beside it.
+fn split_chip(
+    ui: &mut egui::Ui,
+    modifier: &str,
+    rest: &str,
+    left: egui::Color32,
+    right: egui::Color32,
+    selected: bool,
+) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let (left_text, _) = text_on(ui, Some(left));
+    let (right_text, _) = text_on(ui, Some(right));
+    let lg = ui
+        .painter()
+        .layout_no_wrap(modifier.to_string(), font.clone(), left_text);
+    let rg = ui
+        .painter()
+        .layout_no_wrap(rest.to_string(), font, right_text);
+    let pad = ui.spacing().button_padding;
+    let seam = 2.5; // half a space each side of the seam: the words as close as "albino ‹beach›" in one chip
+    let lw = pad.x + lg.size().x + seam;
+    let rw = seam + rg.size().x + pad.x;
+    let h = (lg.size().y.max(rg.size().y) + 2.0 * pad.y).max(ui.spacing().interact_size.y);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(lw + rw, h), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&resp, selected);
+        let cr = visuals.corner_radius;
+        let p = ui.painter();
+        let seam_x = rect.min.x + lw;
+        let left_rect = egui::Rect::from_min_max(rect.min, egui::pos2(seam_x, rect.max.y));
+        let right_rect = egui::Rect::from_min_max(egui::pos2(seam_x, rect.min.y), rect.max);
+        p.with_clip_rect(left_rect.intersect(p.clip_rect()))
+            .rect_filled(rect, cr, left);
+        p.with_clip_rect(right_rect.intersect(p.clip_rect()))
+            .rect_filled(rect, cr, right);
+        if selected || resp.hovered() {
+            p.rect_stroke(rect, cr, visuals.bg_stroke, egui::StrokeKind::Inside);
+        }
+        let y = |g: &egui::Galley| rect.center().y - g.size().y / 2.0;
+        p.galley(
+            egui::pos2(rect.min.x + pad.x, y(&lg)),
+            lg.clone(),
+            left_text,
+        );
+        p.galley(egui::pos2(seam_x + seam, y(&rg)), rg.clone(), right_text);
+    }
+    resp
+}
+
+/// A plain chip's label, `tag ×`, in the text colour its fill needs (a relational tag goes through `split_chip`).
+fn chip_text(ui: &egui::Ui, tag: &str, fill: Option<egui::Color32>) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let (strong, _) = text_on(ui, fill);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &format!("{tag} ×"),
+        0.0,
+        egui::TextFormat::simple(font, strong),
+    );
+    job
+}
+
 /// Tags as buttons that take themselves off the set; `label` leads the row when not empty; `hover` is each chip's tooltip.
 pub fn chips(
     ui: &mut egui::Ui,
@@ -500,6 +721,39 @@ mod tests {
         );
         assert!(!escape(&ctx), "a modified Escape is someone else's");
         assert_eq!(ctx.input(|i| i.events.len()), 2, "and is left in place");
+        ctx.end_pass().textures_delta.clear();
+    }
+    #[test]
+    fn text_goes_black_once_the_fill_is_bright() {
+        use egui::Color32 as C;
+        // Expected by hand (sRGB linearised, WCAG weights): white 1.0, black 0.0; the character tint #2f5a31
+        // is 0.081; the pink picked on 2026-11-05, #cb8d8d, is 0.337; grey 117 is 0.178 and grey 118 is 0.181,
+        // either side of the 0.179 line where black and white text have the same contrast ratio
+        assert!((luminance(C::WHITE) - 1.0).abs() < 1e-4);
+        assert!(luminance(C::BLACK).abs() < 1e-6);
+        assert!((luminance(C::from_rgb(47, 90, 49)) - 0.081).abs() < 0.002);
+        assert!((luminance(C::from_rgb(203, 141, 141)) - 0.337).abs() < 0.002);
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        let ui = &mut egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("tint-test"),
+            egui::UiBuilder::new(),
+        );
+        {
+            let black = |fill| text_on(ui, Some(fill)).0 == C::BLACK;
+            assert!(black(C::WHITE));
+            assert!(black(C::from_rgb(203, 141, 141)));
+            assert!(black(C::from_gray(118)));
+            assert!(!black(C::from_gray(117)));
+            assert!(!black(C::from_rgb(47, 90, 49)));
+            assert!(!black(C::BLACK));
+            assert_eq!(
+                text_on(ui, None).0,
+                ui.visuals().widgets.inactive.text_color(),
+                "no tint: the theme's own"
+            );
+        }
         ctx.end_pass().textures_delta.clear();
     }
 }

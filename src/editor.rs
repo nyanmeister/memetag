@@ -156,7 +156,8 @@ pub enum Action {
     Cancel,
     OpenOriginal,
     /// The file was written; `true` asks the grid to open the next file needing tags in the current results.
-    Saved(FileRow, bool),
+    /// Boxed: the row is the one big variant (clippy's variant-size lint).
+    Saved(Box<FileRow>, bool),
     /// Leave this file as it is and open the next one needing tags.
     Next,
 }
@@ -168,6 +169,9 @@ pub struct EditorUi {
     input: crate::widgets::TagInput,
     error: Option<String>,
     discard: bool,
+    /// The relation gesture (asked 2026-10-31): a right-clicked tag waiting to be applied to the next right-clicked
+    /// tag as `modifier<target>`; a left click or Escape puts it down.
+    relating: Option<String>,
     /// Set by "Save and next": the Saved action then asks for the next file.
     next: bool,
     /// Set by "Skip": leaving (at once, or after the discard prompt) yields Next instead of Cancel.
@@ -194,6 +198,7 @@ impl EditorUi {
             input,
             error: None,
             discard: false,
+            relating: None,
             next: false,
             skip: false,
             primary: Default::default(),
@@ -240,7 +245,7 @@ impl EditorUi {
         }
         if let Some(rx) = &self.save_rx {
             match rx.try_recv() {
-                Ok(Ok(row)) => return Action::Saved(row, self.next),
+                Ok(Ok(row)) => return Action::Saved(Box::new(row), self.next),
                 Ok(Err(e)) => {
                     self.error = Some(e);
                     self.save_rx = None;
@@ -346,8 +351,48 @@ impl EditorUi {
                             action = Action::OpenOriginal;
                         }
                     }
-                    ui.strong("Tags");
-                    crate::widgets::chips(ui, "", &mut draft.tags, |_| "Remove tag".into());
+                    ui.strong("Tags").on_hover_text("One row per category (vocab.toml [categories], set in the Tags card). Click a tag to remove it; right-click one, then right-click the tag it applies to, for a relational tag such as chibi<hatsune miku>. Tags from folders and implications sit dim in their row.");
+                    // A row per category, tinted chips (mockup 2026-10-31: C, then A). The file's own tags are chips
+                    // with a ×; inherited ones (implied, folder) come after them, dim, in the row their category says.
+                    let mut rows: Vec<(String, Vec<String>, Vec<String>)> = c.vocab.category_order().into_iter().chain(std::iter::once(crate::vocab::OTHER.to_string())).map(|n| (n, vec![], vec![])).collect();
+                    let row_of = |t: &str| c.vocab.category_of(t).unwrap_or_else(|| crate::vocab::OTHER.to_string());
+                    for t in &draft.tags { let r = row_of(t); if let Some(row) = rows.iter_mut().find(|(n, _, _)| *n == r) { row.1.push(t.clone()); } }
+                    for (t, source) in &draft.inherited { let r = row_of(t); if let Some(row) = rows.iter_mut().find(|(n, _, _)| *n == r) { row.2.push(format!("{t} ({source})")); } }
+                    let mut clicked: Option<(String, crate::widgets::ChipClick)> = None;
+                    let armed = self.relating.clone();
+                    for (name, own, dim) in &rows {
+                        if own.is_empty() && dim.is_empty() { continue; }
+                        let tint_of = |t: &str| crate::widgets::category_fill(&c.vocab, &row_of(t));
+                        let row = crate::widgets::ChipRow { label: name, show: own, dim, fill: crate::widgets::category_fill(&c.vocab, name), tint_of: &tint_of };
+                        let hover = |t: &str| match &armed {
+                            Some(a) if a == t => "Right-click again, left-click or Escape: never mind".to_string(),
+                            Some(a) => format!("Right-click: write \"{a}<{t}>\" — {a} applies to {t}"),
+                            None => "Click: remove. Right-click: relate it to another tag".to_string(),
+                        };
+                        if let Some(c) = crate::widgets::chip_row(ui, &row, armed.as_deref(), hover) { clicked = Some(c); }
+                    }
+                    // The gesture: right-click arms a modifier, the next right-click names its target; any left click
+                    // (on a chip or elsewhere) or Escape cancels, and while armed a left click removes nothing.
+                    use crate::widgets::ChipClick::*;
+                    match (clicked, self.relating.take()) {
+                        (Some((t, Primary)), None) => { draft.tags.remove(&t); }
+                        (Some((_, Primary)), Some(_)) => {}
+                        (Some((t, Secondary)), None) => self.relating = Some(t),
+                        (Some((t, Secondary)), Some(a)) if a == t => {}
+                        (Some((t, Secondary)), Some(a)) if t.starts_with(crate::vocab::NOT) || crate::vocab::relation(&t).is_some() => self.relating = Some(a), // a denial or a relation is no target; stay armed
+                        (Some((t, Secondary)), Some(a)) => {
+                            let rel = c.vocab.canon(&format!("{a}<{t}>"));
+                            if crate::vocab::relation(&rel).is_some() { draft.tags.remove(&a); draft.tags.insert(rel); } // the bare modifier is implied now
+                        }
+                        (None, Some(a)) => {
+                            let cancel = ui.input_mut(|i| i.pointer.primary_clicked() || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                            if !cancel { self.relating = Some(a); }
+                        }
+                        (None, None) => {}
+                    }
+                    if let Some(a) = &self.relating {
+                        ui.colored_label(crate::widgets::OK, format!("\"{a}\" applies to… right-click the tag it modifies; left-click or Escape cancels"));
+                    }
                     let tag_field = ui.make_persistent_id("edit-tag-input");
                     let ocr_field = ui.make_persistent_id("edit-ocr-text");
                     // Both Tab directions cycle between text fields, skipping chips, disclosure rows and buttons.
@@ -359,11 +404,31 @@ impl EditorUi {
                         m.move_focus(egui::FocusDirection::None);
                         m.request_focus(tag_field);
                     }); }
-                    if let Some(tag) = self.input.show(ui, &self.suggestions, "edit-tag-input", "Add", &draft.tags) { draft.tags.insert(c.vocab.canon(&tag)); }
+                    // typed `modifier<`: complete against this file's own tags, the targets a relation can have here
+                    let relational: Vec<(String, u64, bool)> = match self.input.text.split_once('<') {
+                        Some((m, rest)) if !m.trim().is_empty() && !rest.contains('>') => draft.tags.iter()
+                            .filter(|t| crate::vocab::relation(t).is_none() && !t.starts_with(crate::vocab::NOT) && t.as_str() != m.trim())
+                            .map(|t| (format!("{}<{t}>", m.trim()), 0, false)).collect(),
+                        _ => vec![],
+                    };
+                    let offered: &[(String, u64, bool)] = if relational.is_empty() { &self.suggestions } else { &relational };
+                    if let Some(tag) = self.input.show(ui, offered, "edit-tag-input", "Add", &draft.tags) { draft.tags.insert(c.vocab.canon(&tag)); }
                     if self.input.tab().is_some() { ui.memory_mut(|m| m.request_focus(ocr_field)); }
-                    if !draft.inherited.is_empty() {
-                        ui.collapsing("Tags from folders and implications", |ui| {
-                            for (tag, source) in &draft.inherited { ui.label(format!("{tag} ({source})")); }
+                    // Suggested tags (vocab.toml [suggestions]), from the file's whole tag set — typed, implied, folder — so a
+                    // rule written at the broad tag reaches this file. Left click accepts (adds the tag); right click denies
+                    // (writes not:<tag>, which also silences the suggestion); unanswered ones come back next time (asked
+                    // 2026-10-31, the two clicks the same evening).
+                    let mut known = c.vocab.expand(draft.tags.iter().cloned());
+                    known.extend(draft.inherited.iter().map(|(t, _)| c.vocab.canon(t)));
+                    let suggested = c.vocab.suggests(&known);
+                    if !suggested.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("Suggested").weak()).on_hover_text("Tags that often go with one this file has (Implications card, \"suggests\"). Left click adds one; middle click records that the picture has none (not:tag).");
+                            for s in &suggested {
+                                let resp = ui.button(s).on_hover_text(format!("Click: add \"{s}\". Middle-click: write \"{}\", this picture has none", crate::vocab::Vocab::denied(s)));
+                                if resp.clicked() { draft.tags.insert(s.clone()); }
+                                else if resp.middle_clicked() { draft.tags.insert(crate::vocab::Vocab::denied(s)); }
+                            }
                         });
                     }
                     ui.separator(); ui.strong("OCR text");
@@ -457,6 +522,7 @@ mod tests {
             input,
             error: None,
             discard: false,
+            relating: None,
             next: false,
             skip: false,
             primary: Default::default(),

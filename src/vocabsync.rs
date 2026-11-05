@@ -244,7 +244,8 @@ pub enum Outcome {
     Pushed,
     /// local vocab.toml was replaced from the server; the caller must reimply so the index catches up
     Pulled,
-    Conflict(Conflict),
+    /// boxed: two vocabularies and a diff, against variants that carry nothing
+    Conflict(Box<Conflict>),
 }
 
 /// A stopped sync: both sides moved. Carries enough to show the difference and to resolve it any of the three ways.
@@ -266,6 +267,19 @@ fn lines(v: &Vocab) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for (from, to) in v.rules() {
         out.insert(format!("{from} ⇒ {to}"));
+    }
+    for (from, to) in v.suggestion_rules() {
+        out.insert(format!("{from} suggests {to}"));
+    }
+    let mut cats: Vec<(&String, &String)> = v.categories.iter().collect();
+    cats.sort();
+    for (t, c) in cats {
+        out.insert(format!("{t} is a {c}"));
+    }
+    let mut colors: Vec<(&String, &String)> = v.colors.iter().collect();
+    colors.sort();
+    for (c, hex) in colors {
+        out.insert(format!("{c} is tinted {hex}"));
     }
     let mut aliases: Vec<(&String, &String)> = v.aliases.iter().collect();
     aliases.sort();
@@ -298,6 +312,19 @@ pub fn merge(local: &Vocab, canon: &Vocab) -> (Vocab, Vec<AliasClash>) {
         for t in targets {
             out.add_rule(from, t);
         }
+    }
+    for (from, targets) in &canon.suggestions {
+        for t in targets {
+            out.add_suggestion(from, t);
+        }
+    }
+    // a category both sides set differently stays local's: a kind is a judgement, not a union
+    for (t, c) in &canon.categories {
+        out.categories.entry(t.clone()).or_insert_with(|| c.clone());
+    }
+    // the same for a tint: the machine that chose one keeps it
+    for (c, hex) in &canon.colors {
+        out.colors.entry(c.clone()).or_insert_with(|| hex.clone());
     }
     let mut clashes = Vec::new();
     for (k, target) in &canon.aliases {
@@ -371,11 +398,11 @@ pub fn sync(store: &dyn Canonical, env: &Env) -> Result<Outcome, String> {
         Decision::Conflict => {
             let canon = canon.expect("Conflict only when canonical is present");
             let d = diff(&local, &canon);
-            Ok(Outcome::Conflict(Conflict {
+            Ok(Outcome::Conflict(Box::new(Conflict {
                 local,
                 canon,
                 diff: d,
-            }))
+            })))
         }
     }
 }
@@ -622,6 +649,49 @@ mod tests {
     }
     fn write(env: &Env, body: &str) {
         std::fs::write(&env.vocab_path, body).unwrap();
+    }
+
+    #[test]
+    fn merge_unions_suggestions_as_it_does_implications() {
+        let local: Vocab = toml::from_str("[suggestions]\ncatgirl = [\"tail\"]\n").unwrap();
+        let canon: Vocab = toml::from_str(
+            "[implications]\ncatgirl = [\"kemonomimi\"]\n[suggestions]\ncatgirl = [\"kitty paw hand\"]\nsuccubus = [\"horns\"]\n",
+        )
+        .unwrap();
+        let (merged, clashes) = merge(&local, &canon);
+        assert!(clashes.is_empty());
+        assert_eq!(
+            merged.suggestion_rules(),
+            vec![
+                ("catgirl".to_string(), "kitty paw hand".to_string()),
+                ("catgirl".to_string(), "tail".to_string()),
+                ("succubus".to_string(), "horns".to_string()),
+            ]
+        );
+        assert!(merged.implies("catgirl", "kemonomimi"));
+        // categories union too, local winning a disagreement
+        let mut l2 = local.clone();
+        l2.set_category("catgirl", Some("character"));
+        let mut c2 = canon.clone();
+        c2.set_category("catgirl", Some("subject"));
+        c2.set_category("succubus", Some("character"));
+        let (m2, _) = merge(&l2, &c2);
+        assert_eq!(m2.category_of("catgirl").as_deref(), Some("character"));
+        assert_eq!(m2.category_of("succubus").as_deref(), Some("character"));
+        assert_eq!(
+            diff(&l2, &c2).only_local,
+            vec!["catgirl is a character", "catgirl suggests tail"]
+        );
+        let d = diff(&local, &canon);
+        assert_eq!(d.only_local, vec!["catgirl suggests tail"]);
+        assert_eq!(
+            d.only_canon,
+            vec![
+                "catgirl suggests kitty paw hand",
+                "catgirl ⇒ kemonomimi",
+                "succubus suggests horns"
+            ]
+        );
     }
 
     const A: &str =

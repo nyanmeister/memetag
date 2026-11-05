@@ -467,7 +467,7 @@ fn vocab_step(c: &Cfg, connect_timeout_secs: u32) -> VocabStep {
                 }
                 VocabStep {
                     reimply: false,
-                    conflict: Some(cf),
+                    conflict: Some(*cf),
                     unreachable: false,
                 }
             }

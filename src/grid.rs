@@ -60,17 +60,21 @@ enum Msg {
     },
 }
 
-/// Paths the configured OCR engine has finished, plus human-reviewed ones: the tiles NOT in this set wear the pending badge
-/// (a temporary pending mark).
-fn ocr_done_set(db: &std::path::Path, engine: &str) -> Result<HashSet<String>, String> {
-    let db = Db::open(db)?;
+/// Paths whose text has been read by anyone: an engine on this machine (any engine, not only the configured one),
+/// a human, or another machine whose reading travelled inside the file (`text_in_file`). The tiles NOT in this set wear
+/// the pending badge. Asked 2026-10-31: a machine without an OCR engine of its own must not mark every image as
+/// awaiting one; the per-engine "remaining" count stays the pass's own concern (`memetag ocr --status`).
+fn ocr_done_set(db: &Db) -> Result<HashSet<String>, String> {
     let mut set = HashSet::new();
     let mut st = db
         .conn
-        .prepare("SELECT path FROM text_meta WHERE engine=?1 UNION SELECT path FROM manual_text")
+        .prepare(
+            "SELECT path FROM text_meta UNION SELECT path FROM manual_text \
+             UNION SELECT path FROM files WHERE text_in_file=1",
+        )
         .map_err(|e| e.to_string())?;
     for p in st
-        .query_map([engine], |r| r.get::<_, String>(0))
+        .query_map([], |r| r.get::<_, String>(0))
         .map_err(|e| e.to_string())?
         .flatten()
     {
@@ -126,7 +130,6 @@ struct App {
     copying: bool,
     pulling: bool,
     ocr_done: HashSet<String>,
-    ocr_engine: String,
     ocr_pending: usize,
     editing: Option<(usize, crate::editor::EditorUi)>,
     selected: HashSet<usize>,
@@ -140,11 +143,18 @@ struct App {
     /// grab's pull that found a divergence, closed when a choice has been applied.
     vocab_conflict: Option<crate::vocabconflict::VocabConflictUi>,
     tags_card: Option<crate::tags_card::TagsUi>,
+    /// Whether an egui popup (a chip's category menu, a colour picker) was open when this frame began: Escape then
+    /// belongs to it, which closes itself, and must not reach the card behind it as well (seen 2026-11-05).
+    popup_open: bool,
     /// A rename from the Tags card in flight in the batch panel: (old, new, files in the plan). When the batch
     /// closes with every file done, the vocabulary follows; a partial run leaves the rules alone for the retry.
     pending_rename: Option<(String, String, usize)>,
-    /// Tagging assistant: the progress line under the select bar, untagged tiles outlined, tagged ones dimmed
+    /// Tagging assistant: the progress line under the select bar, untagged tiles outlined, tagged ones dimmed, and
+    /// the results ordered fewest hand-written tags first (asked 2026-10-31: every search becomes a work queue).
     assist: bool,
+    /// Fewer hand-written tags than this and the assistant still counts the file as thin. Yours to raise as the
+    /// collection matures (asked 2026-10-31); kept in window.toml with the size and zoom.
+    thin_below: i64,
     /// Files in the current results with hand-written tags but fewer than `THIN_BELOW`.
     thin_hits: usize,
     thin_all: usize,
@@ -177,7 +187,6 @@ impl App {
         msg_tx: mpsc::Sender<Msg>,
         msg_rx: mpsc::Receiver<Msg>,
         ocr_done: HashSet<String>,
-        ocr_engine: String,
         search_complete: crate::search_complete::SearchComplete,
     ) -> App {
         App {
@@ -188,7 +197,6 @@ impl App {
             msg_tx,
             msg_rx,
             ocr_done,
-            ocr_engine,
             search_complete,
             err: None,
             hits: vec![],
@@ -212,8 +220,10 @@ impl App {
             implications: None,
             vocab_conflict: None,
             tags_card: None,
+            popup_open: false,
             pending_rename: None,
             assist: false,
+            thin_below: THIN_BELOW,
             thin_hits: 0,
             thin_all: 0,
             tagged_all: 0,
@@ -430,11 +440,55 @@ impl App {
                 let n = changed.len();
                 self.apply_vocab(
                     ctx,
-                    vocab,
+                    *vocab,
                     changed,
-                    format!("Implications applied; {n} files changed"),
+                    if n == 0 {
+                        "Rules saved".to_string()
+                    } else {
+                        format!("Implications applied; {n} files changed")
+                    },
                 );
             }
+        }
+    }
+    /// Categories from the Tags card: vocab.toml as it is now (a hand edit or a pull since the window opened is
+    /// kept), the entries changed, saved once, then absorbed and pushed like any other rule change.
+    fn set_categories(&mut self, ctx: &egui::Context, changes: &[(String, Option<String>)]) {
+        let message = match changes {
+            [(tag, Some(c))] => format!("\"{tag}\" is a {c}"),
+            [(tag, None)] => format!("\"{tag}\" has no category"),
+            _ => format!("Categories set on {} tags", changes.len()),
+        };
+        self.edit_vocab(ctx, message, |v| {
+            for (tag, category) in changes {
+                v.set_category(tag, category.as_deref());
+                if let Some(c) = category {
+                    v.ensure_color(c); // a name typed for the first time gets a tint with it
+                }
+            }
+        });
+    }
+    /// Every vocabulary edit from the Tags card: vocab.toml as it is now, `edit` applied, saved once, then absorbed
+    /// and pushed like any other rule change. A failure is a toast; the card keeps showing the saved state.
+    fn edit_vocab(
+        &mut self,
+        ctx: &egui::Context,
+        message: String,
+        edit: impl FnOnce(&mut crate::vocab::Vocab),
+    ) {
+        let mut next = match &self.cfg.vocab.path {
+            Some(p) => crate::vocab::Vocab::load(p),
+            None => self.cfg.vocab.clone(),
+        };
+        edit(&mut next);
+        match next.save() {
+            Ok(()) => {
+                self.apply_vocab(ctx, next, vec![], message);
+                if let Some(card) = &mut self.tags_card {
+                    card.follow(&self.cfg.vocab);
+                }
+            }
+            Err(e) => self.toast = Some((format!("Not saved: {e}"), Instant::now())),
         }
     }
     /// A locally saved vocabulary (an Implications Add or remove, a Tags rename): take the rules over, refresh what
@@ -488,7 +542,7 @@ impl App {
         std::thread::spawn(move || {
             let env = crate::vocabsync::Env::from_home();
             let msg = match crate::vocabsync::sync(&store, &env) {
-                Ok(crate::vocabsync::Outcome::Conflict(cf)) => Some(Msg::VocabConflict(cf)),
+                Ok(crate::vocabsync::Outcome::Conflict(cf)) => Some(Msg::VocabConflict(*cf)),
                 Ok(crate::vocabsync::Outcome::Pulled) => Some(Msg::VocabRefresh),
                 Ok(_) => None,
                 Err(e) => Some(Msg::Toast(format!(
@@ -602,6 +656,9 @@ impl App {
         if !crate::widgets::escape(ctx) {
             return;
         }
+        if self.popup_open {
+            return; // the popup took it and closed itself
+        }
         if self.search_complete.dismiss(&self.q) {
             return;
         }
@@ -687,15 +744,10 @@ impl App {
             }
         });
         // the OCR service writes the index while the window is open: refresh the done-set every 15 s so badges fall off as it works
-        let (tx, ctx, db, engine) = (
-            self.msg_tx.clone(),
-            ctx.clone(),
-            self.cfg.db.clone(),
-            self.ocr_engine.clone(),
-        );
+        let (tx, ctx, db) = (self.msg_tx.clone(), ctx.clone(), self.cfg.db.clone());
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(15));
-            if let Ok(set) = ocr_done_set(&db, &engine) {
+            if let Ok(set) = Db::open(&db).and_then(|db| ocr_done_set(&db)) {
                 if tx.send(Msg::OcrDone(set)).is_err() {
                     return;
                 }
@@ -824,17 +876,22 @@ impl App {
             .iter()
             .filter(|&&i| hand_tagged(&self.rows[i]))
             .count();
+        let below = self.thin_below;
         self.thin_hits = self
             .hits
             .iter()
-            .filter(|&&i| tier(&self.rows[i]) == Tier::Thin)
+            .filter(|&&i| tier(&self.rows[i], below) == Tier::Thin)
             .count();
-        self.thin_all = self.rows.iter().filter(|r| tier(r) == Tier::Thin).count();
+        self.thin_all = self
+            .rows
+            .iter()
+            .filter(|r| tier(r, below) == Tier::Thin)
+            .count();
     }
     /// Narrow the search to files with a few hand-written tags but fewer than the assistant's threshold.
     fn show_thin(&mut self) {
         let q = self.q.trim();
-        let thin = format!("tag_count.gt:0, tag_count.lt:{THIN_BELOW}");
+        let thin = format!("tag_count.gt:0, tag_count.lt:{}", self.thin_below);
         self.q = if q.is_empty() {
             thin
         } else {
@@ -852,7 +909,7 @@ impl App {
             .iter()
             .chain(tail.iter())
             .copied()
-            .find(|&i| i != current && tier(&self.rows[i]) != Tier::Tagged);
+            .find(|&i| i != current && tier(&self.rows[i], self.thin_below) != Tier::Tagged);
         match next {
             Some(i) => self.edit(i, ctx),
             None => {
@@ -965,6 +1022,9 @@ impl App {
         // an image search lists the closest first (stable, so ties stay newest first); Enter then copies the best match
         if let Some(img) = wanted.first() {
             hits.sort_by_key(|&i| similar(img, &self.rows[i].path).unwrap_or(u32::MAX));
+        } else if self.assist {
+            // the assistant puts the work first: fewest hand-written tags, newest first within a count (stable)
+            hits.sort_by_key(|&i| self.rows[i].xmp_tag_count);
         }
         self.hits = hits;
         self.recount_ocr();
@@ -1039,6 +1099,33 @@ impl App {
         match card.show(ctx, &self.cfg) {
             crate::tags_card::Action::None => {}
             crate::tags_card::Action::Close => self.tags_card = None,
+            crate::tags_card::Action::Categories(changes) => self.set_categories(ctx, &changes),
+            crate::tags_card::Action::Color(c, rgb) => {
+                let message = match rgb {
+                    Some(rgb) => format!("{c} is tinted {}", crate::vocab::hex(rgb)),
+                    None => format!("{c} wears its own tint again"),
+                };
+                self.edit_vocab(ctx, message, |v| v.set_color(&c, rgb));
+            }
+            crate::tags_card::Action::AddCategory(c) => {
+                self.edit_vocab(ctx, format!("New category: {c}"), |v| {
+                    v.ensure_color(&c);
+                });
+            }
+            crate::tags_card::Action::RenameCategory(from, to) => {
+                self.edit_vocab(ctx, format!("Category \"{from}\" is now \"{to}\""), |v| {
+                    v.rename_category(&from, &to);
+                });
+            }
+            crate::tags_card::Action::RemoveCategory(c) => {
+                self.edit_vocab(
+                    ctx,
+                    format!("Category \"{c}\" removed; its tags have none"),
+                    |v| {
+                        v.remove_category(&c);
+                    },
+                );
+            }
             crate::tags_card::Action::Batch {
                 paths,
                 add,
@@ -1214,11 +1301,16 @@ impl eframe::App for App {
             let path = self.cfg.db.with_file_name("window.toml");
             let _ = std::fs::write(
                 &path,
-                format!("# written by memetag on exit; the next grab opens like this\nwidth = {w:.0}\nheight = {h:.0}\nzoom = {zoom}\n"),
+                format!(
+                    "# written by memetag on exit; the next grab opens like this\nwidth = {w:.0}\nheight = {h:.0}\nzoom = {zoom}\n\
+                     # tagging assistant: on or off, and the hand-written tag count below which a file is thin\nassist = {}\nthin_below = {}\n",
+                    self.assist, self.thin_below
+                ),
             );
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
+        self.popup_open = egui::Popup::is_any_open(ui.ctx());
         ui.add_enabled_ui(self.library_menu.is_none(), |ui| self.frame(ui));
         if let Some(menu) = &mut self.library_menu {
             match menu.show(ui.ctx()) {
@@ -1439,7 +1531,7 @@ impl App {
                 crate::editor::Action::OpenOriginal => self.open_external(index, ctx),
                 crate::editor::Action::Saved(row, next) => {
                     let slot = self.hits.iter().position(|&h| h == index);
-                    self.rows[index] = row;
+                    self.rows[index] = *row;
                     self.editing = None;
                     self.search_complete.refresh(&self.rows);
                     self.refilter();
@@ -1475,6 +1567,8 @@ impl App {
             .find(|key| input.consume_key(egui::Modifiers::NONE, *key))
         });
         let mut copy_first = false;
+        // set inside the closures below, acted on after they return (they borrow ui, not self's rows)
+        let (mut reorder, mut recount) = (false, false);
         egui::Panel::top("query").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("memetag").strong());
@@ -1542,14 +1636,16 @@ impl App {
                             None => self.tags_card = Some(crate::tags_card::TagsUi::new(&self.cfg)),
                         }
                     }
-                    ui.toggle_value(&mut self.assist, "Tagging assistant").on_hover_text("How much of the collection carries tags you wrote. Untagged tiles get an orange outline, thinly tagged ones (fewer than 3 tags) a yellow one, tagged ones dim. Folder and implied tags do not count.");
+                    if ui.toggle_value(&mut self.assist, "Tagging assistant").on_hover_text(format!("How much of the collection carries tags you wrote. Untagged tiles get an orange outline, thinly tagged ones (fewer than {} tags) a yellow one, tagged ones dim, and the results go fewest tags first. Folder and implied tags do not count.", self.thin_below)).changed() { reorder = true; }
                 });
             });
             if self.assist {
                 ui.horizontal(|ui| {
                     let pct = |n: usize, of: usize| if of == 0 { 0.0 } else { 100.0 * n as f64 / of as f64 };
                     ui.label(format!("Tagged by hand: {} of {} files ({:.1}%, {:.1}% thinly)", self.tagged_all, self.rows.len(), pct(self.tagged_all, self.rows.len()), pct(self.thin_all, self.rows.len())))
-                        .on_hover_text(format!("Thinly: hand-written tags, but fewer than {THIN_BELOW}"));
+                        .on_hover_text(format!("Thinly: hand-written tags, but fewer than {}", self.thin_below));
+                    ui.label("·"); ui.label("thin below").on_hover_text("Fewer hand-written tags than this counts as thinly tagged. Raise it as the collection matures; remembered with the window size.");
+                    if ui.add(egui::DragValue::new(&mut self.thin_below).range(1..=50).speed(0.05)).on_hover_text("Drag or type; 1 to 50").changed() { recount = true; }
                     if self.err.is_none() && self.hits.len() != self.rows.len() {
                         ui.label("·"); ui.label(format!("in these results: {} of {} ({:.1}%)", self.tagged_hits, self.hits.len(), pct(self.tagged_hits, self.hits.len())));
                     }
@@ -1570,7 +1666,7 @@ impl App {
                         if ui
                             .link(format!("show only the {thin} thinly tagged"))
                             .on_hover_text(format!(
-                                "Files with hand-written tags but fewer than {THIN_BELOW}; adds tag_count.gt:0, tag_count.lt:{THIN_BELOW} to the search"
+                                "Files with hand-written tags but fewer than {0}; adds tag_count.gt:0, tag_count.lt:{0} to the search", self.thin_below
                             ))
                             .clicked()
                         {
@@ -1580,6 +1676,11 @@ impl App {
                 });
             }
         });
+        if reorder {
+            self.refilter(); // the assistant's order comes and goes with the toggle
+        } else if recount {
+            self.recount_tagged(); // a new threshold moves files between the thin and tagged tiers
+        }
         if copy_first {
             if let Some(&i) = self.hits.first() {
                 self.copy(i, false, ctx);
@@ -1623,7 +1724,7 @@ impl App {
                             ui.painter().rect_filled(cell, 4.0, ui.visuals().widgets.inactive.bg_fill);
                             if self.tex.get(&self.rows[i].id).map(|t| t.is_none()).unwrap_or(false) { paint_undecodable(ui, cell, &self.rows[i]); } // decode failed: say what it is instead of a blank tile
                             if self.awaits_ocr(i) { paint_ocr_pending(ui, cell); }
-                            if self.assist { paint_assist(ui, cell, tier(&self.rows[i])); }
+                            if self.assist { paint_assist(ui, cell, tier(&self.rows[i], self.thin_below)); }
                             if self.selected.contains(&i) { paint_selection(ui, cell); } continue };
                         let row = &self.rows[i];
                         let frame_size = egui::vec2(tex_size.x / frames as f32, tex_size.y);
@@ -1634,7 +1735,7 @@ impl App {
                         let bg = if resp.hovered() { ui.visuals().widgets.hovered.bg_fill } else { ui.visuals().widgets.inactive.bg_fill };
                         ui.painter().rect_filled(cell, 4.0, bg);
                         egui::Image::from_texture(egui::load::SizedTexture::new(tid, draw.size())).uv(uv).paint_at(ui, draw);
-                        if self.assist { paint_assist(ui, cell, tier(row)); } // before the Edit button, so the dimming never covers it
+                        if self.assist { paint_assist(ui, cell, tier(row, self.thin_below)); } // before the Edit button, so the dimming never covers it
                         // Hover controls must not advance the wrapped grid's layout cursor.
                         if ui.rect_contains_pointer(cell) && ui.place(edit_rect, egui::Button::new("Edit")).clicked() { edit_hit = true; edit = Some(i); }
                         let similar_rect = egui::Rect::from_min_size(edit_rect.right_top() + egui::vec2(4.0, 0.0), egui::vec2(58.0, 24.0));
@@ -1653,7 +1754,7 @@ impl App {
                             ui.label(egui::RichText::new("Tags").strong());
                             if row.tags.is_empty() { ui.label("No tags yet"); }
                             else { ui.label(row.tags.iter().map(String::as_str).collect::<Vec<_>>().join(" · ")); }
-                            match (self.assist, tier(row)) {
+                            match (self.assist, tier(row, self.thin_below)) {
                                 (true, Tier::Untagged) => { ui.colored_label(widgets::UNTAGGED, "No tags written by hand yet"); }
                                 (true, Tier::Thin) => { ui.colored_label(widgets::THIN, format!("Only {} written by hand", plural(row.xmp_tag_count, "tag"))); }
                                 _ => {}
@@ -1665,7 +1766,7 @@ impl App {
                                 if caption.len() < row.text.len() { caption.push('…'); }
                                 ui.label(caption);
                             }
-                            if row.kind == "image" && !self.ocr_done.contains(&row.path) { ui.label(format!("Awaiting OCR by {}", self.ocr_engine)); }
+                            if row.kind == "image" && !self.ocr_done.contains(&row.path) { ui.label("Not read yet: no OCR text from any engine or machine"); }
                             ui.separator();
                             ui.label(if row.kind == "video" { "Copies a file link" }
                                      else if row.format == "gif" { "Copies the whole GIF with animation" }
@@ -1717,7 +1818,7 @@ impl App {
     }
 }
 
-/// Small "OCR" pill in the tile's bottom-left corner: this image has not been read by the configured engine yet.
+/// Small "OCR" pill in the tile's bottom-left corner: no one has read this image's text yet (see `ocr_done_set`).
 fn paint_ocr_pending(ui: &egui::Ui, cell: egui::Rect) {
     let pill = egui::Rect::from_min_size(
         cell.left_bottom() + egui::vec2(5.0, -21.0),
@@ -1740,17 +1841,17 @@ fn hand_tagged(r: &FileRow) -> bool {
     r.xmp_tag_count > 0
 }
 /// Fewer hand-written tags than this and the Tagging assistant still counts the file as work to do.
-const THIN_BELOW: i64 = 3;
+const THIN_BELOW: i64 = 3; // the default; the live value is `App::thin_below`
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tier {
     Untagged,
     Thin,
     Tagged,
 }
-fn tier(r: &FileRow) -> Tier {
+fn tier(r: &FileRow, thin_below: i64) -> Tier {
     match r.xmp_tag_count {
         0 => Tier::Untagged,
-        n if n < THIN_BELOW => Tier::Thin,
+        n if n < thin_below => Tier::Thin,
         _ => Tier::Tagged,
     }
 }
@@ -1841,24 +1942,20 @@ pub fn run(c: &Cfg, q: &str) -> Result<(), String> {
     }
     let search_complete = crate::search_complete::SearchComplete::new(c, &rows);
     let (msg_tx, msg_rx) = mpsc::channel();
-    let ocr_engine = crate::ocr::current_label(c);
-    let ocr_done = ocr_done_set(&c.db, &ocr_engine).unwrap_or_default();
-    let mut app = App::new(
-        c,
-        rows,
-        q,
-        msg_tx,
-        msg_rx,
-        ocr_done,
-        ocr_engine,
-        search_complete,
-    );
+    let ocr_done = Db::open(&c.db)
+        .and_then(|db| ocr_done_set(&db))
+        .unwrap_or_default();
+    let mut app = App::new(c, rows, q, msg_tx, msg_rx, ocr_done, search_complete);
     app.refilter();
     let title = format!(
         "memetag · {} frames, ≤{} fps",
         c.strip_frames, c.preview_fps
     );
-    let (size, zoom) = window_prefs(&c.db.with_file_name("window.toml"));
+    let prefs = window_prefs(&c.db.with_file_name("window.toml"));
+    let (size, zoom) = (prefs.size, prefs.zoom);
+    app.assist = prefs.assist;
+    app.thin_below = prefs.thin_below;
+    app.refilter(); // the assistant's order, when it was on
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(size)
@@ -1880,32 +1977,58 @@ pub fn run(c: &Cfg, q: &str) -> Result<(), String> {
     .map_err(|e| format!("gui: {e}"))
 }
 
-/// The last window size (points at zoom 1) and zoom factor, from `window.toml` beside the index; the defaults
-/// when there is none or it does not parse. Sizes are clamped to something a monitor can show.
-fn window_prefs(path: &Path) -> ([f32; 2], f32) {
-    let default = ([1100.0, 760.0], 1.0);
+/// What `window.toml` beside the index remembers between launches.
+#[derive(Debug, PartialEq)]
+struct WindowPrefs {
+    /// points at zoom 1
+    size: [f32; 2],
+    zoom: f32,
+    assist: bool,
+    thin_below: i64,
+}
+impl Default for WindowPrefs {
+    fn default() -> Self {
+        WindowPrefs {
+            size: [1100.0, 760.0],
+            zoom: 1.0,
+            assist: false,
+            thin_below: THIN_BELOW,
+        }
+    }
+}
+/// The last window size, zoom and assistant settings from `window.toml`; the defaults when there is none or it
+/// does not parse. Sizes are clamped to something a monitor can show, the threshold to 1..=50; a bad size drops
+/// back to the default size but keeps the other keys, each key standing on its own.
+fn window_prefs(path: &Path) -> WindowPrefs {
+    let mut p = WindowPrefs::default();
     let Ok(text) = std::fs::read_to_string(path) else {
-        return default;
+        return p;
     };
     let Ok(t) = text.parse::<toml::Table>() else {
-        return default;
+        return p;
     };
     let num = |k: &str| {
         t.get(k)
             .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
             .map(|f| f as f32)
     };
-    match (num("width"), num("height"), num("zoom")) {
-        (Some(w), Some(h), z)
-            if (200.0..=16000.0).contains(&w) && (150.0..=16000.0).contains(&h) =>
-        {
-            (
-                [w, h],
-                z.filter(|z| (0.25..=4.0).contains(z)).unwrap_or(1.0),
-            )
+    if let (Some(w), Some(h)) = (num("width"), num("height")) {
+        if (200.0..=16000.0).contains(&w) && (150.0..=16000.0).contains(&h) {
+            p.size = [w, h];
         }
-        _ => default,
     }
+    if let Some(z) = num("zoom").filter(|z| (0.25..=4.0).contains(z)) {
+        p.zoom = z;
+    }
+    if let Some(a) = t.get("assist").and_then(|v| v.as_bool()) {
+        p.assist = a;
+    }
+    if let Some(n) = t.get("thin_below").and_then(|v| v.as_integer()) {
+        if (1..=50).contains(&n) {
+            p.thin_below = n;
+        }
+    }
+    p
 }
 
 /// CJK fallback font (egui's bundled fonts do not cover every OCR language).
@@ -1961,6 +2084,121 @@ mod vocab_refresh_tests {
     use super::*;
 
     #[test]
+    fn window_prefs_keep_the_assistant_and_its_threshold_each_key_on_its_own() {
+        // Expected by hand: every key present and sane → taken; a threshold out of 1..=50 → the default 3 while
+        // the rest is kept; an absurd size → the default size, but assist and the threshold still read; no file
+        // → all defaults.
+        let dir = std::env::temp_dir().join(format!("memetag-grid-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("window.toml");
+        std::fs::write(
+            &f,
+            "width = 1400\nheight = 900\nzoom = 1.25\nassist = true\nthin_below = 5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            window_prefs(&f),
+            WindowPrefs {
+                size: [1400.0, 900.0],
+                zoom: 1.25,
+                assist: true,
+                thin_below: 5
+            }
+        );
+        std::fs::write(
+            &f,
+            "width = 1400\nheight = 900\nzoom = 1.25\nassist = true\nthin_below = 99\n",
+        )
+        .unwrap();
+        assert_eq!(window_prefs(&f).thin_below, 3);
+        assert!(window_prefs(&f).assist);
+        std::fs::write(
+            &f,
+            "width = 10\nheight = 900\nassist = true\nthin_below = 2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            window_prefs(&f),
+            WindowPrefs {
+                size: [1100.0, 760.0],
+                zoom: 1.0,
+                assist: true,
+                thin_below: 2
+            }
+        );
+        std::fs::write(&f, "width = 1400\nheight = 900\nzoom = 1\n").unwrap(); // a file from before 0.3.8
+        assert_eq!(
+            window_prefs(&f),
+            WindowPrefs {
+                size: [1400.0, 900.0],
+                zoom: 1.0,
+                assist: false,
+                thin_below: 3
+            }
+        );
+        assert_eq!(window_prefs(&dir.join("none.toml")), WindowPrefs::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn thin_tier_follows_the_threshold() {
+        let row = |n: i64| FileRow {
+            id: "x".into(),
+            path: "x.png".into(),
+            format: "png".into(),
+            kind: "image".into(),
+            width: 1,
+            height: 1,
+            size: 1,
+            mtime: 0.0,
+            created_at: 0.0,
+            tagged_at: 0.0,
+            xmp_tag_count: n,
+            tags: Default::default(),
+            text: String::new(),
+        };
+        assert_eq!(tier(&row(0), 3), Tier::Untagged);
+        assert_eq!(tier(&row(2), 3), Tier::Thin);
+        assert_eq!(tier(&row(3), 3), Tier::Tagged);
+        assert_eq!(tier(&row(3), 5), Tier::Thin); // the bar rose
+        assert_eq!(tier(&row(1), 1), Tier::Tagged); // the bar at its floor: anything written counts
+    }
+    #[test]
+    fn badge_falls_off_once_anyone_has_read_the_text() {
+        // Expected by hand: a.png read by some engine (not the configured one), b.png reviewed by a human, c.png with
+        // text embedded in the file by another machine (text_in_file), d.png never read. The badge stays only on d.
+        // The previous rule ("done by the configured engine") would have badged a and c as well.
+        let dir = std::env::temp_dir().join(format!("memetag-grid-badge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("index.sqlite")).unwrap();
+        for (name, in_file) in [("a.png", 0), ("b.png", 0), ("c.png", 1), ("d.png", 0)] {
+            db.conn
+                .execute(
+                    "INSERT INTO files(id,path,format,kind,width,height,size,mtime,created_at,tagged_at,xmp_tag_count,indexed_at,text_in_file) \
+                     VALUES(?1,?1,'png','image',4,4,10,1.0,1.0,0.0,0,1.0,?2)",
+                    rusqlite::params![name, in_file],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO text_meta VALUES('a.png','ollama:some-other-model',1.0,0.5)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO manual_text VALUES('b.png','typed by hand')",
+                [],
+            )
+            .unwrap();
+        let read = ocr_done_set(&db).unwrap();
+        let mut got: Vec<&str> = read.iter().map(String::as_str).collect();
+        got.sort();
+        assert_eq!(got, ["a.png", "b.png", "c.png"]);
+        assert!(!read.contains("d.png"), "an unread image keeps its badge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn rules_only_pull_refreshes_search_aliases_and_existing_rows() {
         let dir = std::env::temp_dir().join(format!("memetag-grid-vocab-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1986,16 +2224,7 @@ mod vocab_refresh_tests {
         let rows = db.all().unwrap();
         let completion = crate::search_complete::SearchComplete::new(&c, &rows);
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(
-            &c,
-            rows,
-            "animal",
-            tx,
-            rx,
-            HashSet::new(),
-            String::new(),
-            completion,
-        );
+        let mut app = App::new(&c, rows, "animal", tx, rx, HashSet::new(), completion);
         app.refilter();
         assert!(app.hits.is_empty());
         app.selected.insert(0);

@@ -160,4 +160,6 @@ and `ionice`, so the heavy work stays where the files are. Details in
 - Every executable answers `--version` without configuration, a display or a
   model.
 
-License: GPL-3.0-or-later.
+License: AGPL-3.0-or-later. The network-interaction clause means anyone who runs a
+modified `memetag serve` for other people must offer them its source — closing the
+hosted-service loophole that plain GPL leaves open.

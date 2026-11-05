@@ -245,8 +245,8 @@ pub fn help(c: &Cfg, awaiting: usize) -> Vec<(&'static str, Vec<HelpLine>)> {
     };
     vec![
         ("What it is", vec![
-            Text("A pass over every image reads the text in it into the index, so t:word (or text:word, t.w:word for whole words) finds memes by what they say. Tiles marked OCR have not been read by the current engine yet; hover a tile to see its text.".into()),
-            Text(format!("Engine label in the index: {engine}. {awaiting} of the images in this search still await it.")),
+            Text("A pass over every image reads the text in it into the index, so t:word (or text:word, t.w:word for whole words) finds memes by what they say. Tiles marked OCR have no text yet from any engine, any machine or a human; hover a tile to see its text.".into()),
+            Text(format!("Engine label in the index: {engine}. {awaiting} of the images in this search have not been read by anyone. A machine without an engine of its own still sees text other machines embedded in the files.")),
             Text(which),
         ]),
         ("With systemd (the units in the repo's systemd/ folder, installed under ~/.config/systemd/user/)", vec![
@@ -264,14 +264,14 @@ pub fn help(c: &Cfg, awaiting: usize) -> Vec<(&'static str, Vec<HelpLine>)> {
         ]),
         ("Action tags (meta:)", vec![
             Text(crate::meta::ACTIONS.iter().map(|a| format!("\"{}\" → \"{}\": {}.", a.request, a.done, a.what)).collect::<Vec<_>>().join(" ")),
-            Text("Tag a file with one in the editor or a mass edit, then run the pass here; it reads the image with the ollama model above, translates with config.toml translate_model when set (a text-only translator such as Hunyuan-MT; translate_prompt with {text}) and writes the file directly, so the request tag changes only when the work landed. Reviewed text keeps its mark. Request tags stay in the autocomplete even when no file carries them.".into()),
+            Text("Tag a file with one in the editor or a mass edit; memetag ocr handles translation requests after its own images (so the service does them too), and memetag meta runs every action by itself. The pass reads the image with the ollama model above, translates with config.toml translate_model when set (a text-only translator such as Hunyuan-MT; translate_prompt with {text}) and writes the file directly, so the request tag changes only when the work landed. Reviewed text keeps its mark. Request tags stay in the autocomplete even when no file carries them.".into()),
             Cmd("memetag meta", Run::Terminal),
             Cmd("memetag meta --dry-run", Run::Quiet),
             Text("Speech needs a transcriber on the PATH: config.toml speech_command, by default whisper.cpp's whisper-cli (CPU or an accelerated build) with ~/.local/share/whisper/ggml-large-v3.bin and the Silero VAD model beside it; ffprobe checks for an audio track first, and voice detection turns music into no text rather than a guess.".into()),
         ]),
         ("Good to know", vec![
             Text("New files reach the index through memetag pull (grab runs one before opening); OCR only sees indexed images. While the pass writes the index, pull and grab's pull step stand aside.".into()),
-            Text("Changing ocr_model starts over: the pass redoes every image with the new model, keeping old text until each is replaced. Text you typed in the editor is never overwritten by any engine.".into()),
+            Text("Changing ocr_model starts over: the pass redoes every image with the new model, keeping old text until each is replaced (tiles keep their text and wear no badge meanwhile; memetag ocr --status counts what the new engine still has to do). Text you typed in the editor is never overwritten by any engine.".into()),
             Text("OCR text lives in the index until embedded in the files. memetag ocr --embed writes newly read text; memetag embed-text writes existing results. Back up the collection before a bulk pass. For network sources, run bulk embedding on the file server using a consistent index backup, as described in docs/legacy-workflow.md. Until embedded, text does not travel with copied files or survive a fresh index. memetag ocr --status prints how many images await embedding.".into()),
         ]),
     ]
@@ -325,15 +325,7 @@ pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
         .iter()
         .filter(|r| r.kind == "image" && !done.contains(&r.path) && !reviewed.contains(&r.path))
         .count();
-    if total == 0 {
-        println!("ocr [{want}]: nothing to do — every image is done");
-        return Ok(());
-    }
-    eprintln!(
-        "ocr [{want}]: {total} images to do{} ({remaining_all} not yet done by this engine)",
-        if o.limit > 0 { " (limited)" } else { "" }
-    );
-    // graceful stop: SIGTERM/SIGINT → finish the image in flight, then summarise and exit 0
+    // graceful stop: SIGTERM/SIGINT → finish the image (or file) in flight, then summarise and exit 0
     let stop = Arc::new(AtomicBool::new(false));
     {
         let s = stop.clone();
@@ -343,11 +335,25 @@ pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     }
-    if o.engine == "ollama" {
-        run_ollama(c, &db, &o, &want, todo, stop)
+    if total == 0 {
+        println!("ocr [{want}]: nothing to do — every image is done");
     } else {
-        run_tesseract(c, &db, &o, &want, todo, stop)
+        eprintln!(
+            "ocr [{want}]: {total} images to do{} ({remaining_all} not yet done by this engine)",
+            if o.limit > 0 { " (limited)" } else { "" }
+        );
+        if o.engine == "ollama" {
+            run_ollama(c, &db, &o, &want, todo, stop.clone())?;
+        } else {
+            run_tesseract(c, &db, &o, &want, todo, stop.clone())?;
+        }
     }
+    // The subsequent pass (asked 2026-10-31): translation requests, now that the images they sit on have their text.
+    // Only when the image pass ended on its own; a stop is a stop.
+    if !stop.load(Ordering::SeqCst) {
+        crate::meta::translate_after_ocr(c, &db, &stop);
+    }
+    Ok(())
 }
 
 fn status(db: &Db) -> Result<(), String> {
@@ -458,6 +464,36 @@ pub fn image_bytes(path: &std::path::Path, format: &str) -> Result<Vec<u8>, Stri
     Ok(out.into_inner())
 }
 
+/// A per-image failure in the ollama pass, and so whether it should count toward the "stop, something is down" guard.
+/// `Model`: the server answered but could not read this one image (a repeat-loop abort, a bad request). It is still
+/// reachable, so skip this image and keep going; the image stays un-done and a later run retries it (no permanent
+/// failure marker — asked 2026-10-27: retry on a later run rather than mark it failed). `Unreachable`: the file or the server could not be
+/// reached at all (share unmounted, connection refused). A run of these means the pass should stop and wait.
+enum Skip {
+    Model(String),
+    Unreachable(String),
+}
+
+impl Skip {
+    fn counts_toward_stop(&self) -> bool {
+        matches!(self, Skip::Unreachable(_))
+    }
+    fn msg(&self) -> &str {
+        match self {
+            Skip::Model(s) | Skip::Unreachable(s) => s,
+        }
+    }
+}
+
+impl From<crate::ollama::GenErr> for Skip {
+    fn from(e: crate::ollama::GenErr) -> Self {
+        match e {
+            crate::ollama::GenErr::Status(s) => Skip::Model(s),
+            crate::ollama::GenErr::Transport(s) => Skip::Unreachable(s),
+        }
+    }
+}
+
 fn run_ollama(
     c: &Cfg,
     db: &Db,
@@ -482,10 +518,13 @@ fn run_ollama(
     let reader_cfg = c.clone();
     // reader thread: one file ahead, so the mount latency overlaps the model's work
     let (tx, rx) = mpsc::sync_channel::<(String, String, Result<Vec<u8>, String>)>(2);
-    let stop_r = stop.clone();
+    // `quit` is this pass saying it is over (done, stopped or given up), so the reader fetches no further file; it is
+    // not the stop flag, which stays the signal's alone — the caller reads it to tell a stop from a finished pass.
+    let quit = Arc::new(AtomicBool::new(false));
+    let (stop_r, quit_r) = (stop.clone(), quit.clone());
     let reader = std::thread::spawn(move || {
         for (_id, rel, format) in todo {
-            if stop_r.load(Ordering::SeqCst) {
+            if stop_r.load(Ordering::SeqCst) || quit_r.load(Ordering::SeqCst) {
                 break;
             }
             let b = reader_cfg
@@ -506,19 +545,26 @@ fn run_ollama(
             break;
         }
         let t = Instant::now();
-        let res = bytes.and_then(|b| {
-            crate::ollama::generate(&agent, &url, &o.model, &o.prompt, Some(&b), 700)
-        });
+        let res: Result<String, Skip> = match bytes {
+            Err(e) => Err(Skip::Unreachable(e)),
+            Ok(b) => crate::ollama::generate(&agent, &url, &o.model, &o.prompt, Some(&b), 700)
+                .map_err(Skip::from),
+        };
         let secs = t.elapsed().as_secs_f64();
         n += 1;
         match res {
-            Err(e) => {
+            Err(skip) => {
                 errs += 1;
-                consecutive_errs += 1;
-                eprintln!("skip {rel}: {e}");
-                if consecutive_errs >= 20 {
-                    rc = Err("20 consecutive failures — is the share mounted and ollama up? stopping so a rerun can retry them".into());
-                    break;
+                eprintln!("skip {rel}: {}", skip.msg());
+                if skip.counts_toward_stop() {
+                    consecutive_errs += 1;
+                    if consecutive_errs >= 20 {
+                        rc = Err("20 consecutive unreachable errors — is the share mounted and ollama up? stopping so a rerun can retry them".into());
+                        break;
+                    }
+                } else {
+                    // the server answered, so it is up; one image it cannot read must not wedge the whole queue
+                    consecutive_errs = 0;
                 }
             }
             Ok(text) => {
@@ -541,7 +587,7 @@ fn run_ollama(
             );
         }
     }
-    stop.store(true, Ordering::SeqCst);
+    quit.store(true, Ordering::SeqCst);
     drop(rx);
     let _ = reader.join();
     println!(
@@ -778,7 +824,27 @@ fn cap(s: &mut String, n: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_model;
+    use super::{clean_model, Skip};
+
+    #[test]
+    fn a_model_failure_is_skipped_but_an_unreachable_one_stops_the_run() {
+        // A repeat-loop abort comes back as a Status error: the server answered, so it is a per-image Model skip
+        // that must not count toward the stop guard, or one bad image wedges the whole queue (the 2026-10-27 bug).
+        let model = Skip::from(crate::ollama::GenErr::Status(
+            "ollama 500: prediction aborted, token repeat limit reached".into(),
+        ));
+        assert!(matches!(model, Skip::Model(_)));
+        assert!(!model.counts_toward_stop());
+        assert!(model.msg().contains("token repeat limit"));
+        // A transport error, and a file the reader could not open, both mean infrastructure is down: these count.
+        let transport = Skip::from(crate::ollama::GenErr::Transport(
+            "ollama: connection refused".into(),
+        ));
+        assert!(matches!(transport, Skip::Unreachable(_)));
+        assert!(transport.counts_toward_stop());
+        assert!(Skip::Unreachable("share not mounted".into()).counts_toward_stop());
+    }
+
     #[test]
     fn degenerate_outputs_become_empty() {
         assert_eq!(

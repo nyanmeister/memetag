@@ -42,6 +42,16 @@ sets. `CARGO_TARGET_DIR` is respected. The archive includes runtime-library and
 checksum manifests; it is a native build for the build host, not a static binary
 or a promise of compatibility with older distributions.
 
+On the build machine, `tools/install-release.sh ARCHIVE.tar.gz` installs a full
+archive under `~/.local/lib/memetag/releases/VERSION-COMMIT` and repoints the
+three `~/.local/bin` links atomically; the user units call `memetag` through those
+links and are not touched. It keeps the current release, the previous one that ran
+for at least a day (a release replaced sooner is an iteration and is dropped) and
+any `--pin`ned names, never removes a release with a live process, and appends
+every action to `releases/install.log`. `--rollback` swaps current and previous;
+`--list` shows the roles; `MEMETAG_PREFIX` relocates everything for a trial. Core
+and desktop archives are refused so a release never mixes builds.
+
 The local Arch split-package recipe is `packaging/PKGBUILD`. From a clean commit,
 create its input beside a copy of the recipe:
 

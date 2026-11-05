@@ -521,8 +521,30 @@ fn run_source(
 
 #[cfg(feature = "gui")]
 struct Loaded {
+    /// hand-written (xmp) tags → how many of the selected files carry each
     counts: BTreeMap<String, usize>,
+    /// tags of any source (xmp, folder, implied) on every selected file: what the suggestion rules key on
+    shared_all: BTreeSet<String>,
     suggestions: Vec<(String, u64, bool)>,
+}
+/// What answering a suggestion puts in a batch plan (asked 2026-10-31). Accepting adds the tag to every file, and
+/// takes a denial back off any file that carries one; denying writes the denial and takes the tag off any file that
+/// carries it. Both halves show in the plan before Apply, so a hand-written tag never leaves unseen. `carried` says
+/// whether any selected file has a tag.
+#[cfg(feature = "gui")]
+fn suggestion_ops(
+    tag: &str,
+    deny: bool,
+    carried: impl Fn(&str) -> bool,
+) -> (String, Option<String>) {
+    let not = crate::vocab::Vocab::denied(tag);
+    if deny {
+        let off = carried(tag).then(|| tag.to_string());
+        (not, off)
+    } else {
+        let off = carried(&not).then_some(not);
+        (tag.to_string(), off)
+    }
 }
 #[cfg(feature = "gui")]
 pub enum Action {
@@ -563,21 +585,37 @@ impl BatchUi {
             let result = (|| -> Result<Loaded, String> {
                 let db = Db::open_cfg(&c)?;
                 let mut counts = BTreeMap::new();
+                let mut all: BTreeMap<String, usize> = BTreeMap::new();
                 let mut st = db
                     .conn
-                    .prepare("SELECT path,tag FROM tags WHERE source='xmp'")
+                    .prepare("SELECT path,tag,source FROM tags")
                     .map_err(|e| e.to_string())?;
                 for row in st
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })
                     .map_err(|e| e.to_string())?
                 {
-                    let (path, tag) = row.map_err(|e| e.to_string())?;
+                    let (path, tag, source) = row.map_err(|e| e.to_string())?;
                     if selected.contains(&path) {
-                        *counts.entry(tag).or_insert(0) += 1;
+                        if source == "xmp" {
+                            *counts.entry(tag.clone()).or_insert(0) += 1;
+                        }
+                        *all.entry(tag).or_insert(0) += 1;
                     }
                 }
+                let shared_all = all
+                    .into_iter()
+                    .filter(|(_, n)| *n == selected.len())
+                    .map(|(t, _)| t)
+                    .collect();
                 Ok(Loaded {
                     counts,
+                    shared_all,
                     suggestions: autocomplete::load(&c),
                 })
             })();
@@ -689,6 +727,24 @@ impl BatchUi {
                 ui.add_enabled_ui(!busy && !self.finished, |ui| {
                     ui.strong("Add to every selected image"); widgets::chips(ui, "", &mut self.add, |_| String::new());
                     if let Some(tag) = self.add_input.show(ui, &loaded.suggestions, "batch-add", "Add to list", &self.add) { let tag = c.vocab.canon(&tag); if !tag.is_empty() { self.remove.remove(&tag); self.add.insert(tag); } }
+                    // Suggestions keyed on the tags every selected image shares (any source); one answer for the whole
+                    // selection, same clicks as the editor. Hidden once answered in this plan.
+                    let suggested: Vec<String> = c.vocab.suggests(&loaded.shared_all).into_iter()
+                        .filter(|s| !self.add.contains(s) && !self.add.contains(&crate::vocab::Vocab::denied(s))).collect();
+                    if !suggested.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("Suggested").weak()).on_hover_text("From a tag every selected image shares. Left click adds it to every one; right click records that none of them has it (not:tag). A file carrying the opposite loses it, shown in the plan below.");
+                            for s in &suggested {
+                                let resp = ui.button(s).on_hover_text(format!("Click: add \"{s}\" to all. Right-click: write \"{}\" on all", crate::vocab::Vocab::denied(s)));
+                                let answer = if resp.clicked() { Some(false) } else if resp.secondary_clicked() { Some(true) } else { None };
+                                if let Some(deny) = answer {
+                                    let (on, off) = suggestion_ops(s, deny, |t| loaded.counts.get(t).is_some_and(|n| *n > 0));
+                                    self.remove.remove(&on); self.add.insert(on);
+                                    if let Some(off) = off { self.add.remove(&off); self.remove.insert(off); }
+                                }
+                            }
+                        });
+                    }
                     ui.separator(); ui.strong("Remove from every selected image"); widgets::chips(ui, "", &mut self.remove, |_| String::new());
                     // tags every selected image already carries: one click puts one in the Remove list (wishlist, 2026-09-22: mis-tags)
                     let shared: Vec<String> = loaded.counts.iter().filter(|(t, n)| **n == self.paths.len() && !self.remove.contains(*t)).map(|(t, _)| (*t).clone()).collect();
@@ -760,6 +816,38 @@ impl Drop for BatchUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "gui")]
+    fn answering_a_suggestion_in_a_batch_takes_the_opposite_off_only_where_it_is_carried() {
+        // Expected by hand. Nothing carries either form: accept = +tail, deny = +not:tail, nothing removed.
+        let none = |_: &str| false;
+        assert_eq!(suggestion_ops("tail", false, none), ("tail".into(), None));
+        assert_eq!(
+            suggestion_ops("tail", true, none),
+            ("not:tail".into(), None)
+        );
+        // Some file carries not:tail: accepting also lists not:tail for removal; denying removes nothing extra.
+        let has_denial = |t: &str| t == "not:tail";
+        assert_eq!(
+            suggestion_ops("tail", false, has_denial),
+            ("tail".into(), Some("not:tail".into()))
+        );
+        assert_eq!(
+            suggestion_ops("tail", true, has_denial),
+            ("not:tail".into(), None)
+        );
+        // Some file carries tail: denying lists tail for removal; accepting removes nothing extra.
+        let has_tag = |t: &str| t == "tail";
+        assert_eq!(
+            suggestion_ops("tail", true, has_tag),
+            ("not:tail".into(), Some("tail".into()))
+        );
+        assert_eq!(
+            suggestion_ops("tail", false, has_tag),
+            ("tail".into(), None)
+        );
+    }
 
     #[test]
     fn editor_reads_server_bytes_despite_stale_mount_and_fails_closed() {

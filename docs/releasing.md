@@ -1,6 +1,6 @@
 # Release preparation
 
-Memetag is licensed under GPL-3.0-or-later. Dependencies and optional models retain
+Memetag is licensed under AGPL-3.0-or-later. Dependencies and optional models retain
 their own licenses. All Cargo packages have `publish = false`; GitHub source hosting
 does not publish them to crates.io.
 

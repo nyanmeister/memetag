@@ -344,15 +344,62 @@ fn perform(
 pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
     let o = parse(args)?;
     let db = Db::open_cfg(&c)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let s = stop.clone();
+        let _ = ctrlc::set_handler(move || {
+            s.store(true, Ordering::SeqCst);
+            eprintln!("meta: stop requested — finishing the current file");
+        });
+    }
+    run_pass(c, &db, o.only.as_deref(), o.limit, o.dry, &stop)
+}
+
+/// The pass `memetag ocr` runs after its own images: translation requests, whose source text the OCR pass has just
+/// put in the index. Never a reason for the OCR run to fail — a problem is printed and the request tags stay for
+/// `memetag meta`. A machine without a vision model (no `ocr_model`) only says how many are waiting.
+pub fn translate_after_ocr(c: &Cfg, db: &Db, stop: &AtomicBool) {
+    let waiting = match files_with(db, &c.vocab.canon(TRANSLATE)) {
+        Ok(v) => v.len(),
+        Err(e) => {
+            eprintln!("meta: could not list translation requests: {e}");
+            return;
+        }
+    };
+    if waiting == 0 {
+        return;
+    }
+    if c.ocr_model.is_none() {
+        eprintln!(
+            "meta: {waiting} files carry \"{TRANSLATE}\"; this machine has no ollama vision model (ocr_model in \
+             config.toml), so they wait for `memetag meta` on one that does"
+        );
+        return;
+    }
+    if let Err(e) = run_pass(c, db, Some(TRANSLATE), 0, false, stop) {
+        eprintln!("meta: translation pass not run: {e}");
+    }
+}
+
+/// Every action's files (or `only` that action's), `limit` per action, `dry` lists them. The stop flag is honoured
+/// between files; the caller owns the signal handler, since a process gets one.
+pub fn run_pass(
+    c: &Cfg,
+    db: &Db,
+    only: Option<&str>,
+    limit: usize,
+    dry: bool,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     // what is asked for, per action
     let mut work: Vec<(&Action, Vec<String>)> = vec![];
     for a in ACTIONS {
-        if o.only.as_deref().is_some_and(|t| t != a.request) {
+        if only.is_some_and(|t| t != a.request) {
             continue;
         }
-        let mut files = files_with(&db, &c.vocab.canon(a.request))?;
-        if o.limit > 0 {
-            files.truncate(o.limit);
+        let mut files = files_with(db, &c.vocab.canon(a.request))?;
+        if limit > 0 {
+            files.truncate(limit);
         }
         if !files.is_empty() {
             work.push((a, files));
@@ -362,7 +409,7 @@ pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
         println!("meta: no file carries a request tag — nothing to do");
         return Ok(());
     }
-    if o.dry {
+    if dry {
         for (a, files) in &work {
             for p in files {
                 println!("  {p}  ({})", a.request);
@@ -380,18 +427,10 @@ pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
     }
     let x = Ctx {
         c,
-        db: &db,
+        db,
         agent: crate::ollama::agent(),
         url: format!("{}/api/generate", c.ollama_url),
     };
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let s = stop.clone();
-        let _ = ctrlc::set_handler(move || {
-            s.store(true, Ordering::SeqCst);
-            eprintln!("meta: stop requested — finishing the current file");
-        });
-    }
     let wanted: std::collections::HashSet<&String> =
         work.iter().flat_map(|(_, f)| f.iter()).collect();
     let rows: std::collections::HashMap<String, crate::index::FileRow> = db
