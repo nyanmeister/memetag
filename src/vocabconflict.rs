@@ -8,6 +8,7 @@
 //! card stays open and disabled ("Working…") until that lands, so a slow server cannot freeze the window.
 use crate::vocab::Vocab;
 use crate::vocabsync::{self, AliasClash, Conflict};
+use crate::widgets;
 use eframe::egui;
 use std::collections::BTreeSet;
 
@@ -75,17 +76,15 @@ impl VocabConflictUi {
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Action {
-        let max = ctx.content_rect().size() - egui::vec2(40.0, 60.0);
         let mut open = true;
         let mut action = Action::None;
-        egui::Window::new("Rules differ from the server")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .vscroll(true)
-            .default_size(egui::vec2(620.0, 520.0).min(max))
-            .max_size(max)
-            .show(ctx, |ui| {
+        widgets::card(
+            ctx,
+            "Rules differ from the server",
+            [620.0, 520.0],
+            true,
+            &mut open,
+            |ui| {
                 ui.label(
                     "Your alias/implication rules and the server's both changed since the last sync. Nothing has been \
                      written on either side. Choose how to reconcile them.",
@@ -166,7 +165,8 @@ impl VocabConflictUi {
                         ui.label("Working…");
                     }
                 });
-            });
+            },
+        );
         if let Action::Resolve(_) = &action {
             self.working = true; // keep the card up, disabled, until the grid's thread reports back
         }

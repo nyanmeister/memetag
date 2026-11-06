@@ -6,7 +6,7 @@
 //! 2026-10-07: "when I hit Add rule, I want that to be the last step").
 use crate::{
     autocomplete,
-    index::{Db, FileRow},
+    index::FileRow,
     vocab::Vocab,
     widgets::{self, TagInput},
     Cfg,
@@ -85,16 +85,17 @@ pub struct ImplicationsUi {
     from_tags: BTreeSet<String>,
     to_tags: BTreeSet<String>,
     suggestions: Vec<(String, u64, bool)>,
+    /// The suggestions being read from the index when the card opens.
+    load: widgets::Pending<Vec<(String, u64, bool)>>,
     counts: HashMap<String, usize>,
     error: Option<String>,
     note: Option<String>,
-    closing: bool,
 }
 
 impl ImplicationsUi {
     /// Opens on the vocabulary as it is on disk, so rules edited by hand since the window started show up too.
-    pub fn new(c: &Cfg, rows: &[FileRow]) -> Self {
-        let vocab = Self::fresh(c);
+    pub fn new(c: &Cfg, rows: &[FileRow], ctx: &egui::Context) -> Self {
+        let vocab = c.vocab_on_disk();
         let opened = vocab.rules().into_iter().collect();
         let opened_suggestions = vocab.suggestion_rules().into_iter().collect();
         let mut from = TagInput::default();
@@ -111,11 +112,14 @@ impl ImplicationsUi {
             to: TagInput::default(),
             from_tags: BTreeSet::new(),
             to_tags: BTreeSet::new(),
-            suggestions: autocomplete::load(c),
+            suggestions: vec![],
+            load: {
+                let c = c.clone();
+                widgets::Pending::spawn(ctx, move || Ok(autocomplete::load(&c)))
+            },
             counts: HashMap::new(),
             error: None,
             note: None,
-            closing: false,
         };
         this.refresh(rows);
         this.regroup();
@@ -126,14 +130,6 @@ impl ImplicationsUi {
         self.groups = group(self.vocab.rules(), &self.opened);
         self.sgroups = group(self.vocab.suggestion_rules(), &self.opened_suggestions);
         self.heights = vec![0.0; self.groups.len()];
-    }
-    /// vocab.toml as it is now. Every edit starts from this rather than from the card's copy, so a hand edit or
-    /// a pull since the card opened is kept, never written over.
-    fn fresh(c: &Cfg) -> Vocab {
-        match &c.vocab.path {
-            Some(p) => Vocab::load(p),
-            None => c.vocab.clone(),
-        }
     }
     /// How many files carry each tag a rule or the new-rule fields mention; one pass over the rows.
     pub fn refresh(&mut self, rows: &[FileRow]) {
@@ -163,9 +159,6 @@ impl ImplicationsUi {
         let n = rows.iter().filter(|r| r.tags.contains(tag)).count();
         self.counts.insert(tag.to_string(), n);
     }
-    pub fn request_close(&mut self) {
-        self.closing = true;
-    }
     /// The vocabulary changed under the card (its own Add came back through the grid, a rename from the Tags card,
     /// a pull from the server): show those rules.
     pub fn follow(&mut self, vocab: &Vocab) {
@@ -173,11 +166,9 @@ impl ImplicationsUi {
         self.regroup();
     }
     fn files(&self, tag: &str) -> String {
-        match self.counts.get(tag) {
-            Some(1) => "1 file".into(),
-            Some(n) => format!("{n} files"),
-            None => String::new(),
-        }
+        self.counts
+            .get(tag)
+            .map_or(String::new(), |n| widgets::count(*n, "file"))
     }
     /// One group's row: the specific tag, its file count, the arrow, and a chip per rule that removes it. Rules
     /// added since the card opened are coloured. Returns the (a, b) of a clicked chip.
@@ -226,84 +217,177 @@ impl ImplicationsUi {
     }
 
     pub fn show(&mut self, ctx: &egui::Context, c: &Cfg, rows: &[FileRow]) -> Action {
-        let max = ctx.content_rect().size() - egui::vec2(40.0, 60.0);
+        if let Some(Ok(s)) = self.load.poll(ctx, "suggestions") {
+            self.suggestions = s;
+        }
         let mut open = true;
         let mut action = Action::None;
         let mut remove: Option<(String, String)> = None;
         let mut remove_suggestion: Option<(String, String)> = None;
         let mut add = false;
-        egui::Window::new("Implications and suggestions").open(&mut open).collapsible(false).resizable(true)
-            .default_size(egui::vec2(760.0, 820.0).min(max)).max_size(max).show(ctx, |ui| {
-            egui::CollapsingHeader::new("How this works").default_open(true).show(ui, |ui| {
-                for (head, text) in HELP { ui.label(egui::RichText::new(*head).strong()); ui.label(*text); ui.add_space(4.0); }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
+        widgets::card(
+            ctx,
+            "Implications and suggestions",
+            [760.0, 820.0],
+            false,
+            &mut open,
+            |ui| {
+                egui::CollapsingHeader::new("How this works")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (head, text) in HELP {
+                            ui.label(egui::RichText::new(*head).strong());
+                            ui.label(*text);
+                            ui.add_space(4.0);
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("New rule").strong());
                 ui.radio_value(&mut self.kind, Kind::Implies, "implies").on_hover_text("Always true: B is added to every file that has A, now and on every later file");
                 ui.radio_value(&mut self.kind, Kind::Suggests, "suggests").on_hover_text("Often true: the editor offers B on files that have A; you accept or deny it per file");
             });
-            let suggests = self.kind == Kind::Suggests;
-            // Both sides take any number of chips; Add makes one rule per combination, since a rule is always one arrow.
-            let chips = |ui: &mut egui::Ui, label: &str, tags: &mut BTreeSet<String>, input: &mut TagInput, id: &str, counts: &HashMap<String, usize>| {
-                widgets::chips(ui, label, tags, |t| { let n = counts.get(t).copied().unwrap_or(0); format!("{n} {} carry \"{t}\" today. Click to take it off this rule.", if n == 1 { "file" } else { "files" }) });
-                if let Some(t) = input.show(ui, &self.suggestions, id, "Use", tags) { let t = c.vocab.canon(&t); if !t.is_empty() { tags.insert(t); } }
-            };
-            let (mut from_tags, mut to_tags) = (std::mem::take(&mut self.from_tags), std::mem::take(&mut self.to_tags));
-            chips(ui, "Every file tagged", &mut from_tags, &mut self.from, "imply-from", &self.counts);
-            chips(ui, if suggests { "may also have" } else { "also gets" }, &mut to_tags, &mut self.to, "imply-to", &self.counts);
-            widgets::tab_chain(ui, &mut [&mut self.from, &mut self.to]);
-            let fresh: Vec<String> = from_tags.iter().chain(to_tags.iter()).filter(|t| !self.counts.contains_key(*t)).cloned().collect();
-            self.from_tags = from_tags; self.to_tags = to_tags;
-            for t in fresh { self.count_one(&t, rows); }
-            // Ctrl+S adds too, and first takes a tag still being typed in either field, so the chord needs no Enter before it
-            if widgets::chord(ui.ctx(), egui::Key::S) {
-                for (input, tags) in [(&mut self.from, &mut self.from_tags), (&mut self.to, &mut self.to_tags)] {
-                    let t = c.vocab.canon(input.text.trim());
-                    if !t.is_empty() { tags.insert(t); input.text.clear(); }
+                let suggests = self.kind == Kind::Suggests;
+                // Both sides take any number of chips; Add makes one rule per combination, since a rule is always one arrow.
+                let chips = |ui: &mut egui::Ui,
+                             label: &str,
+                             tags: &mut BTreeSet<String>,
+                             input: &mut TagInput,
+                             id: &str,
+                             counts: &HashMap<String, usize>| {
+                    widgets::chips(ui, label, tags, |t| {
+                        let n = counts.get(t).copied().unwrap_or(0);
+                        format!(
+                            "{n} {} carry \"{t}\" today. Click to take it off this rule.",
+                            if n == 1 { "file" } else { "files" }
+                        )
+                    });
+                    if let Some(t) = input.show(ui, &self.suggestions, id, "Use", tags) {
+                        let t = c.vocab.canon(&t);
+                        if !t.is_empty() {
+                            tags.insert(t);
+                        }
+                    }
+                };
+                let (mut from_tags, mut to_tags) = (
+                    std::mem::take(&mut self.from_tags),
+                    std::mem::take(&mut self.to_tags),
+                );
+                chips(
+                    ui,
+                    "Every file tagged",
+                    &mut from_tags,
+                    &mut self.from,
+                    "imply-from",
+                    &self.counts,
+                );
+                chips(
+                    ui,
+                    if suggests {
+                        "may also have"
+                    } else {
+                        "also gets"
+                    },
+                    &mut to_tags,
+                    &mut self.to,
+                    "imply-to",
+                    &self.counts,
+                );
+                widgets::tab_chain(ui, &mut [&mut self.from, &mut self.to]);
+                let fresh: Vec<String> = from_tags
+                    .iter()
+                    .chain(to_tags.iter())
+                    .filter(|t| !self.counts.contains_key(*t))
+                    .cloned()
+                    .collect();
+                self.from_tags = from_tags;
+                self.to_tags = to_tags;
+                for t in fresh {
+                    self.count_one(&t, rows);
                 }
-                add = !self.from_tags.is_empty() && !self.to_tags.is_empty();
-            }
-            ui.horizontal(|ui| {
+                // Ctrl+S adds too, and first takes a tag still being typed in either field, so the chord needs no Enter before it
+                if widgets::chord(ui.ctx(), egui::Key::S) {
+                    for (input, tags) in [
+                        (&mut self.from, &mut self.from_tags),
+                        (&mut self.to, &mut self.to_tags),
+                    ] {
+                        let t = c.vocab.canon(input.text.trim());
+                        if !t.is_empty() {
+                            tags.insert(t);
+                            input.text.clear();
+                        }
+                    }
+                    add = !self.from_tags.is_empty() && !self.to_tags.is_empty();
+                }
+                ui.horizontal(|ui| {
                 let n = self.from_tags.len() * self.to_tags.len();
                 if ui.add_enabled(n > 0, egui::Button::new(if n > 1 { format!("Add {n} rules") } else { "Add rule".to_string() }))
                     .on_hover_text(if suggests { "Write the suggestion now: vocab.toml, then the server (Ctrl+S)" } else { "Write the rule and apply it now: vocab.toml, the index, then the server (Ctrl+S)" }).clicked() { add = true; }
                 if let Some(n) = &self.note { ui.colored_label(widgets::OK, n); }
             });
-            if let Some(e) = &self.error { ui.colored_label(widgets::ERROR, e); } // own line, so a long refusal wraps instead of widening the card
-            ui.add_space(8.0); ui.separator();
-            // Grouped by the specific tag, one row each, its implied tags as chips; the list grows, so it comes last,
-            // in its own scroll with only the rows in view drawn. The suggestions follow in the same scroll.
-            let rules: usize = self.groups.iter().map(|g| g.bs.len()).sum();
-            let srules: usize = self.sgroups.iter().map(|g| g.bs.len()).sum();
-            ui.label(egui::RichText::new(format!("Rules ({} tags imply something, {} rules)", self.groups.len(), rules)).strong());
-            if rules == 0 { ui.label("None yet."); }
-            let mut heights = std::mem::take(&mut self.heights);
-            egui::ScrollArea::vertical().id_salt("rules").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
-                widgets::rows_in_view(ui, viewport, &mut heights, 22.0, |ui, i| {
-                    if let Some((a, b)) = self.rule_row(ui, i, false) { remove = Some((a, b)); }
-                });
+                if let Some(e) = &self.error {
+                    ui.colored_label(widgets::ERROR, e);
+                } // own line, so a long refusal wraps instead of widening the card
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new(format!("Suggestions ({} tags suggest something, {} rules)", self.sgroups.len(), srules)).strong());
-                if srules == 0 { ui.label("None yet."); }
-                for i in 0..self.sgroups.len() {
-                    if let Some((a, b)) = self.rule_row(ui, i, true) { remove_suggestion = Some((a, b)); }
+                ui.separator();
+                // Grouped by the specific tag, one row each, its implied tags as chips; the list grows, so it comes last,
+                // in its own scroll with only the rows in view drawn. The suggestions follow in the same scroll.
+                let rules: usize = self.groups.iter().map(|g| g.bs.len()).sum();
+                let srules: usize = self.sgroups.iter().map(|g| g.bs.len()).sum();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Rules ({} tags imply something, {} rules)",
+                        self.groups.len(),
+                        rules
+                    ))
+                    .strong(),
+                );
+                if rules == 0 {
+                    ui.label("None yet.");
                 }
-            });
-            self.heights = heights;
-        });
+                let mut heights = std::mem::take(&mut self.heights);
+                egui::ScrollArea::vertical()
+                    .id_salt("rules")
+                    .auto_shrink([false, false])
+                    .show_viewport(ui, |ui, viewport| {
+                        widgets::rows_in_view(ui, viewport, &mut heights, 22.0, |ui, i| {
+                            if let Some((a, b)) = self.rule_row(ui, i, false) {
+                                remove = Some((a, b));
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Suggestions ({} tags suggest something, {} rules)",
+                                self.sgroups.len(),
+                                srules
+                            ))
+                            .strong(),
+                        );
+                        if srules == 0 {
+                            ui.label("None yet.");
+                        }
+                        for i in 0..self.sgroups.len() {
+                            if let Some((a, b)) = self.rule_row(ui, i, true) {
+                                remove_suggestion = Some((a, b));
+                            }
+                        }
+                    });
+                self.heights = heights;
+            },
+        );
         if let Some((a, b)) = remove_suggestion {
-            let mut next = Self::fresh(c);
+            let mut next = c.vocab_on_disk();
             next.remove_suggestion(&a, &b);
             action = self.apply(c, next, "Removed");
         }
         if let Some((a, b)) = remove {
-            let mut next = Self::fresh(c);
+            let mut next = c.vocab_on_disk();
             next.remove_rule(&a, &b);
             action = self.apply(c, next, "Removed");
         }
         if add {
-            let mut next = Self::fresh(c);
+            let mut next = c.vocab_on_disk();
             let mut errors = vec![];
             let mut added = 0;
             for a in &self.from_tags {
@@ -357,8 +441,7 @@ impl ImplicationsUi {
                 self.error = refused;
             }
         }
-        if !open || self.closing {
-            self.closing = false;
+        if !open {
             action = Action::Close;
         }
         action
@@ -366,13 +449,7 @@ impl ImplicationsUi {
     /// Write the rules and rebuild the derived rows. The file goes first: if the index update then fails, the next
     /// reindex or Add catches up, and nothing is lost. The card keeps showing the old rules until the write succeeds.
     fn apply(&mut self, c: &Cfg, mut next: Vocab, did: &str) -> Action {
-        let written = next.save().and_then(|_| {
-            Db::open_cfg(c).and_then(|db| {
-                db.reimply(&next)
-                    .map_err(|e| format!("vocab.toml saved, but the index was not updated: {e}"))
-            })
-        });
-        match written {
+        match crate::index::save_rules(c, &mut next) {
             Ok(changed) => {
                 self.vocab = next.clone();
                 self.regroup();

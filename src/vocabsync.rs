@@ -195,17 +195,10 @@ impl Env {
         (fp.len() == 64 && fp.bytes().all(|b| b.is_ascii_hexdigit())).then(|| fp.to_string())
     }
     fn write_base(&self, fp: &str) -> Result<(), String> {
-        let tmp = self.base_path.with_extension("sync.tmp");
-        std::fs::write(&tmp, format!("{fp}\n"))
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.base_path)
-            .map_err(|e| format!("replace {}: {e}", self.base_path.display()))
+        crate::paths::atomic_write(&self.base_path, format!("{fp}\n").as_bytes())
     }
     fn write_local(&self, bytes: &[u8]) -> Result<(), String> {
-        let tmp = self.vocab_path.with_extension("toml.tmp");
-        std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.vocab_path)
-            .map_err(|e| format!("replace {}: {e}", self.vocab_path.display()))
+        crate::paths::atomic_write(&self.vocab_path, bytes)
     }
 }
 
@@ -344,62 +337,94 @@ pub fn merge(local: &Vocab, canon: &Vocab) -> (Vocab, Vec<AliasClash>) {
     (out, clashes)
 }
 
-/// Read the local vocab and the canonical bytes, then act on the table. On a conflict nothing is written.
+/// Both sides as the table reads them, loaded once: the local file (refused when it does not parse, before any
+/// server call: a push would carry the damage to every machine), the canonical bytes and their vocabulary, and
+/// the three fingerprints the direction is decided from.
+struct Sides {
+    local: Vocab,
+    local_fp: String,
+    canon_bytes: Option<Vec<u8>>,
+    canon: Option<Vocab>,
+    canon_fp: Option<String>,
+    base: Option<String>,
+}
+impl Sides {
+    fn read(store: &dyn Canonical, env: &Env) -> Result<Sides, String> {
+        let local = Vocab::load(&env.vocab_path);
+        if let Some(e) = &local.broken {
+            return Err(format!(
+                "{} did not parse ({e}); fix it before syncing, or a push would carry the damage to every machine",
+                env.vocab_path.display()
+            ));
+        }
+        let canon_bytes = store.fetch()?;
+        let canon = canon_bytes
+            .as_deref()
+            .map(|b| {
+                toml::from_str::<Vocab>(&String::from_utf8_lossy(b)).map_err(|e| {
+                    format!(
+                        "the canonical vocab on {} did not parse ({e}); fix it there",
+                        store.name()
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(Sides {
+            local_fp: fingerprint(&local),
+            canon_fp: canon.as_ref().map(fingerprint),
+            base: env.read_base(),
+            local,
+            canon_bytes,
+            canon,
+        })
+    }
+    fn decision(&self) -> Decision {
+        decide(
+            &self.local_fp,
+            self.canon_fp.as_deref(),
+            self.base.as_deref(),
+        )
+    }
+    /// The server's copy, bytes and parsed, for the commands that need one to exist.
+    fn canonical(self) -> Result<(Vocab, Vec<u8>, Vocab), String> {
+        match (self.canon_bytes, self.canon) {
+            (Some(bytes), Some(canon)) => Ok((self.local, bytes, canon)),
+            _ => Err("the server has no canonical vocab yet".into()),
+        }
+    }
+}
+
+/// Read both sides, then act on the table. On a conflict nothing is written.
 pub fn sync(store: &dyn Canonical, env: &Env) -> Result<Outcome, String> {
     let _lock = Vocab::lock(&env.vocab_path)?;
-    let local = Vocab::load(&env.vocab_path);
-    if let Some(e) = &local.broken {
-        return Err(format!(
-            "{} did not parse ({e}); fix it before syncing, or a push would carry the damage to every machine",
-            env.vocab_path.display()
-        ));
-    }
-    let local_bytes = local.original.clone().unwrap_or_default();
-    let local_fp = fingerprint(&local);
-
-    let canon_bytes = store.fetch()?;
-    let canon: Option<Vocab> = match &canon_bytes {
-        Some(b) => {
-            let text = String::from_utf8_lossy(b);
-            let v: Vocab = toml::from_str(&text).map_err(|e| {
-                format!(
-                    "the canonical vocab on {} did not parse ({e}); fix it there",
-                    store.name()
-                )
-            })?;
-            Some(v)
-        }
-        None => None,
-    };
-    let canon_fp = canon.as_ref().map(fingerprint);
-    let base = env.read_base();
-
-    match decide(&local_fp, canon_fp.as_deref(), base.as_deref()) {
-        Decision::Seed => {
-            store.store(canon_bytes.as_deref(), &local_bytes)?;
-            env.write_base(&local_fp)?;
-            Ok(Outcome::Seeded)
+    let s = Sides::read(store, env)?;
+    match s.decision() {
+        Decision::Seed | Decision::Push => {
+            let seeded = s.canon_bytes.is_none();
+            let local_bytes = s.local.original.clone().unwrap_or_default();
+            store.store(s.canon_bytes.as_deref(), &local_bytes)?;
+            env.write_base(&s.local_fp)?;
+            Ok(if seeded {
+                Outcome::Seeded
+            } else {
+                Outcome::Pushed
+            })
         }
         Decision::InSync => {
-            env.write_base(&local_fp)?; // record the agreement so a later one-sided edit is unambiguous
+            env.write_base(&s.local_fp)?; // record the agreement so a later one-sided edit is unambiguous
             Ok(Outcome::InSync)
         }
-        Decision::Push => {
-            store.store(canon_bytes.as_deref(), &local_bytes)?;
-            env.write_base(&local_fp)?;
-            Ok(Outcome::Pushed)
-        }
         Decision::Pull => {
-            let bytes = canon_bytes.expect("Pull only when canonical is present");
+            let bytes = s.canon_bytes.expect("Pull only when canonical is present");
             env.write_local(&bytes)?;
-            env.write_base(canon_fp.as_deref().expect("canon_fp present with canon"))?;
+            env.write_base(s.canon_fp.as_deref().expect("canon_fp present with canon"))?;
             Ok(Outcome::Pulled)
         }
         Decision::Conflict => {
-            let canon = canon.expect("Conflict only when canonical is present");
-            let d = diff(&local, &canon);
+            let canon = s.canon.expect("Conflict only when canonical is present");
+            let d = diff(&s.local, &canon);
             Ok(Outcome::Conflict(Box::new(Conflict {
-                local,
+                local: s.local,
                 canon,
                 diff: d,
             })))
@@ -409,28 +434,16 @@ pub fn sync(store: &dyn Canonical, env: &Env) -> Result<Outcome, String> {
 
 /// A read-only description of what a sync would do, for `vocab status`. Writes nothing on disk or the server.
 pub fn sync_dry(store: &dyn Canonical, env: &Env) -> Result<String, String> {
-    let local = Vocab::load(&env.vocab_path);
-    if let Some(e) = &local.broken {
+    // a local file that does not parse is a status to report here, not a failure
+    if let Some(e) = &Vocab::load(&env.vocab_path).broken {
         return Ok(format!(
             "local {} does not parse ({e}); fix it before syncing",
             env.vocab_path.display()
         ));
     }
-    let local_fp = fingerprint(&local);
-    let canon_bytes = store.fetch()?;
-    let canon: Option<Vocab> = match &canon_bytes {
-        Some(b) => Some(toml::from_str(&String::from_utf8_lossy(b)).map_err(|e| {
-            format!(
-                "the canonical vocab on {} did not parse ({e})",
-                store.name()
-            )
-        })?),
-        None => None,
-    };
-    let canon_fp = canon.as_ref().map(fingerprint);
-    let base = env.read_base();
-    let (la, li) = (local.aliases.len(), local.rules().len());
-    Ok(match decide(&local_fp, canon_fp.as_deref(), base.as_deref()) {
+    let s = Sides::read(store, env)?;
+    let (la, li) = (s.local.aliases.len(), s.local.rules().len());
+    Ok(match s.decision() {
         Decision::Seed => format!(
             "{} holds no canonical vocab yet; a sync would seed it from your {la} aliases and {li} implications",
             store.name()
@@ -447,20 +460,20 @@ pub fn sync_dry(store: &dyn Canonical, env: &Env) -> Result<String, String> {
             store.name()
         ),
         Decision::Conflict => {
-            let canon = canon.expect("a conflict implies the canonical is present");
-            let d = diff(&local, &canon);
-            let mut s = format!(
+            let canon = s.canon.as_ref().expect("a conflict implies the canonical is present");
+            let d = diff(&s.local, canon);
+            let mut out = format!(
                 "CONFLICT with {}: both sides changed since the last sync.\n",
                 store.name()
             );
             for l in &d.only_local {
-                s.push_str(&format!("  only here:   {l}\n"));
+                out.push_str(&format!("  only here:   {l}\n"));
             }
             for l in &d.only_canon {
-                s.push_str(&format!("  only server: {l}\n"));
+                out.push_str(&format!("  only server: {l}\n"));
             }
-            s.push_str("  resolve: memetag vocab sync --take-mine | --take-theirs | --merge");
-            s
+            out.push_str("  resolve: memetag vocab sync --take-mine | --take-theirs | --merge");
+            out
         }
     })
 }
@@ -468,25 +481,17 @@ pub fn sync_dry(store: &dyn Canonical, env: &Env) -> Result<String, String> {
 /// Resolve a conflict by keeping the local rules: push them and adopt them as the base.
 pub fn take_mine(store: &dyn Canonical, env: &Env) -> Result<(), String> {
     let _lock = Vocab::lock(&env.vocab_path)?;
-    let local = Vocab::load(&env.vocab_path);
-    if let Some(e) = &local.broken {
-        return Err(format!("{} did not parse ({e})", env.vocab_path.display()));
-    }
-    let bytes = local.original.clone().unwrap_or_default();
-    let expected = store.fetch()?;
-    store.store(expected.as_deref(), &bytes)?;
-    env.write_base(&fingerprint(&local))
+    let s = Sides::read(store, env)?;
+    let bytes = s.local.original.clone().unwrap_or_default();
+    store.store(s.canon_bytes.as_deref(), &bytes)?;
+    env.write_base(&s.local_fp)
 }
 
 /// Resolve a conflict by taking the server's rules: overwrite the local file and adopt them as the base. The caller
 /// must reimply afterwards.
 pub fn take_theirs(store: &dyn Canonical, env: &Env) -> Result<(), String> {
     let _lock = Vocab::lock(&env.vocab_path)?;
-    let bytes = store
-        .fetch()?
-        .ok_or("the server has no canonical vocab to take")?;
-    let canon: Vocab = toml::from_str(&String::from_utf8_lossy(&bytes))
-        .map_err(|e| format!("the canonical vocab did not parse ({e})"))?;
+    let (_, bytes, canon) = Sides::read(store, env)?.canonical()?;
     env.write_local(&bytes)?;
     env.write_base(&fingerprint(&canon))
 }
@@ -500,7 +505,7 @@ pub fn resolve_merge(
     resolved: &[(String, String)],
 ) -> Result<Vec<AliasClash>, String> {
     let _lock = Vocab::lock(&env.vocab_path)?;
-    let (local, bytes, canon) = both_sides(store, env)?;
+    let (local, bytes, canon) = Sides::read(store, env)?.canonical()?;
     let (mut merged, clashes) = merge(&local, &canon);
     if clashes.iter().any(|c| {
         !resolved
@@ -534,23 +539,8 @@ pub fn resolve_merge(
 
 /// The union without writing anything, so a caller can show the clashes and decide before committing.
 pub fn preview_merge(store: &dyn Canonical, env: &Env) -> Result<(Vocab, Vec<AliasClash>), String> {
-    let (local, _, canon) = both_sides(store, env)?;
+    let (local, _, canon) = Sides::read(store, env)?.canonical()?;
     Ok(merge(&local, &canon))
-}
-
-/// The local file (a broken one is refused, never merged over) and the server's canonical copy, which comes back
-/// parsed and as the bytes a later compare-and-swap must present.
-fn both_sides(store: &dyn Canonical, env: &Env) -> Result<(Vocab, Vec<u8>, Vocab), String> {
-    let local = Vocab::load(&env.vocab_path);
-    if let Some(e) = &local.broken {
-        return Err(format!("{} did not parse ({e})", env.vocab_path.display()));
-    }
-    let bytes = store
-        .fetch()?
-        .ok_or("the server has no canonical vocab to merge")?;
-    let canon: Vocab = toml::from_str(&String::from_utf8_lossy(&bytes))
-        .map_err(|e| format!("the canonical vocab did not parse ({e})"))?;
-    Ok((local, bytes, canon))
 }
 
 /// The store for the configured server, or `None` when the root is local (nothing to sync against).

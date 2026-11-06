@@ -106,6 +106,57 @@ enum Tok {
     RParen,
 }
 
+/// The three things the lexer and the completion scanner agree on: where an operator word stands alone, where a
+/// quoted run ends, and what a run of query characters means with its quotes and escapes resolved.
+/// An operator word (AND, OR, NOT in any case) standing alone at `i`: it follows the start or a separator and is
+/// followed by the end, whitespace or a separator. Returns the token and the word's length in chars.
+fn operator_word_at(cs: &[char], i: usize) -> Option<(Tok, usize)> {
+    if i > 0
+        && !cs[i - 1].is_whitespace()
+        && !matches!(cs[i - 1], '(' | ')' | ',' | '!' | '|' | '&')
+    {
+        return None;
+    }
+    let end = i + cs[i..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .count();
+    if end == i
+        || !(end == cs.len() || cs[end].is_whitespace() || matches!(cs[end], '(' | ')' | ','))
+    {
+        return None;
+    }
+    word_operator(&cs[i..end].iter().collect::<String>()).map(|t| (t, end - i))
+}
+/// `cs[open]` is a `"`: the index of its closing quote, or `cs.len()` when it never closes. `\"` and `\\` are
+/// escapes inside.
+fn quoted_end(cs: &[char], open: usize) -> usize {
+    let mut j = open + 1;
+    while j < cs.len() && cs[j] != '"' {
+        if cs[j] == '\\' && cs.get(j + 1).is_some_and(|c| matches!(c, '"' | '\\')) {
+            j += 1;
+        }
+        j += 1;
+    }
+    j
+}
+/// The text a run of query characters stands for: quotes dropped, `\"` and `\\` resolved, everything else literal.
+fn unescaped(cs: impl IntoIterator<Item = char>) -> String {
+    let mut out = String::new();
+    let mut it = cs.into_iter().peekable();
+    while let Some(c) = it.next() {
+        if c == '"' {
+            continue;
+        }
+        if c == '\\' && it.peek().is_some_and(|c| matches!(c, '"' | '\\')) {
+            out.push(it.next().unwrap());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn lex(q: &str) -> Result<Vec<Tok>, String> {
     let mut out = vec![];
     let mut cur = String::new();
@@ -128,27 +179,11 @@ fn lex(q: &str) -> Result<Vec<Tok>, String> {
         let c = cs[i];
         // Only standalone, unquoted words are operators. Preserve spaces inside
         // ordinary multiword tags and field values, including text:OR.
-        if i == 0
-            || cs[i - 1].is_whitespace()
-            || matches!(cs[i - 1], '(' | ')' | ',' | '!' | '|' | '&')
-        {
-            let mut end = i;
-            while end < cs.len() && cs[end].is_ascii_alphabetic() {
-                end += 1;
-            }
-            if end > i
-                && (end == cs.len()
-                    || cs[end].is_whitespace()
-                    || matches!(cs[end], '(' | ')' | ','))
-            {
-                let word: String = cs[i..end].iter().collect();
-                if let Some(op) = word_operator(&word) {
-                    flush(&mut cur, &mut quoted, &mut out);
-                    out.push(op);
-                    i = end;
-                    continue;
-                }
-            }
+        if let Some((op, len)) = operator_word_at(&cs, i) {
+            flush(&mut cur, &mut quoted, &mut out);
+            out.push(op);
+            i += len;
+            continue;
         }
         match c {
             ',' => {
@@ -180,17 +215,11 @@ fn lex(q: &str) -> Result<Vec<Tok>, String> {
                 if cur.trim().is_empty() {
                     quoted = true;
                 }
-                let mut j = i + 1;
-                while j < cs.len() && cs[j] != '"' {
-                    if cs[j] == '\\' && cs.get(j + 1).is_some_and(|c| matches!(c, '"' | '\\')) {
-                        j += 1;
-                    }
-                    cur.push(cs[j]);
-                    j += 1;
-                }
+                let j = quoted_end(&cs, i);
                 if j == cs.len() {
                     return Err("unclosed quote".into());
                 }
+                cur.push_str(&unescaped(cs[i + 1..j].iter().copied()));
                 i = j;
                 // The closing quote ends the term when a space or an operator follows: `"a" b` is two terms, not
                 // the tag `a b` (review, 2026-09-22). A suffix glued on, as in `similar:"a, b.png"@20`, still belongs.
@@ -231,16 +260,7 @@ pub fn completion(q: &str, caret: usize) -> Option<(std::ops::Range<usize>, Stri
     let mut spans = vec![];
     while i < chars.len() {
         if chars[i] == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                if chars[i] == '\\' && chars.get(i + 1).is_some_and(|c| matches!(c, '"' | '\\')) {
-                    i += 1;
-                }
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1;
-            }
+            i = (quoted_end(&chars, i) + 1).min(chars.len());
             continue;
         }
         let mut separator = if matches!(chars[i], ',' | '(' | ')') {
@@ -253,22 +273,8 @@ pub fn completion(q: &str, caret: usize) -> Option<(std::ops::Range<usize>, Stri
         if matches!(chars[i], '-' | '!') && chars[start..i].iter().all(|c| c.is_whitespace()) {
             separator = 1;
         }
-        if i == 0
-            || chars[i - 1].is_whitespace()
-            || matches!(chars[i - 1], '(' | ')' | ',' | '!' | '|' | '&')
-        {
-            let mut end = i;
-            while end < chars.len() && chars[end].is_ascii_alphabetic() {
-                end += 1;
-            }
-            if end > i
-                && (end == chars.len()
-                    || chars[end].is_whitespace()
-                    || matches!(chars[end], '(' | ')' | ','))
-                && word_operator(&chars[i..end].iter().collect::<String>()).is_some()
-            {
-                separator = end - i;
-            }
+        if let Some((_, len)) = operator_word_at(&chars, i) {
+            separator = len;
         }
         if separator > 0 {
             spans.push((start, i));
@@ -293,19 +299,7 @@ pub fn completion(q: &str, caret: usize) -> Option<(std::ops::Range<usize>, Stri
         if !raw.starts_with('"') && matches!(term(raw), Expr::Field { .. }) {
             return None;
         }
-        let prefix = &q[offsets[start]..offsets[caret]];
-        let mut prefix_chars = prefix.chars().peekable();
-        let mut decoded = String::new();
-        while let Some(c) = prefix_chars.next() {
-            if c == '"' {
-                continue;
-            }
-            if c == '\\' && prefix_chars.peek().is_some_and(|c| matches!(c, '"' | '\\')) {
-                decoded.push(prefix_chars.next().unwrap());
-            } else {
-                decoded.push(c);
-            }
-        }
+        let decoded = unescaped(q[offsets[start]..offsets[caret]].chars());
         if decoded.trim().is_empty() {
             return None;
         }

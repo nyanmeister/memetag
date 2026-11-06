@@ -237,11 +237,13 @@ impl TextSpace {
                         )
                     })
                     .collect();
+                // Sum in term order: the map's order changes per process, and with it the last bits of
+                // a score, which once swapped two files tied at 0.211 between runs (2026-11-06).
+                v.sort_unstable_by_key(|(id, _)| *id);
                 let norm = v.iter().map(|(_, w)| w * w).sum::<f32>().sqrt();
                 if norm > 0.0 {
                     v.iter_mut().for_each(|(_, w)| *w /= norm);
                 }
-                v.sort_unstable_by_key(|(id, _)| *id);
                 (path, v)
             })
             .collect();
@@ -257,7 +259,7 @@ impl TextSpace {
     fn prototype(&self, paths: &HashSet<String>) -> Option<Vec<f32>> {
         let mut proto = vec![0f32; self.terms];
         let mut n = 0;
-        for p in paths {
+        for p in sorted(paths) {
             if let Some(v) = self.docs.get(p) {
                 for (id, w) in v {
                     proto[*id as usize] += w;
@@ -293,6 +295,13 @@ pub struct Proposal {
 /// (comic 48, 4chan post 33, twitter post 31, cat 26, stonetoss 35, donald trump 21 of 50 at 10 rejections).
 const NEG_WEIGHT: f32 = 0.5;
 
+/// A set's members in one order, so a sum over them rounds the same way in every process.
+fn sorted(paths: &HashSet<String>) -> Vec<&String> {
+    let mut v: Vec<&String> = paths.iter().collect();
+    v.sort();
+    v
+}
+
 /// The unit mean of these files' image vectors; None when none is cached.
 ///
 /// One centroid per side, measured (2026-09-23, eight tags, a third hidden, the hand-tagged pool): the mean of the
@@ -301,7 +310,7 @@ const NEG_WEIGHT: f32 = 0.5;
 fn image_prototype(vecs: &HashMap<String, Vec<f32>>, paths: &HashSet<String>) -> Option<Vec<f32>> {
     let mut proto = vec![0f32; DIM];
     let mut n = 0;
-    for p in paths {
+    for p in sorted(paths) {
         if let Some(v) = vecs.get(p) {
             proto.iter_mut().zip(v).for_each(|(a, b)| *a += b);
             n += 1;

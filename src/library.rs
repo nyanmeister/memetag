@@ -1,11 +1,7 @@
 //! A reversible view of the collection. Excluded rows remain cached, with their OCR and vectors.
-use crate::{locking, Cfg};
+use crate::Cfg;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io::Write,
-    path::{Component, Path, PathBuf},
-};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
@@ -72,13 +68,33 @@ impl Scope {
                 .iter()
                 .any(|p| p.starts_with(dir) && self.contains(p))
     }
+    /// The files under `root` that this scope selects; directories it excludes are never entered. Errors are the
+    /// walker's (an unreadable directory), left to the caller.
+    pub fn walk(
+        &self,
+        root: &Path,
+    ) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> + use<> {
+        let (scope, enter) = (self.clone(), root.to_path_buf());
+        let (keep, root) = (self.clone(), root.to_path_buf());
+        walkdir::WalkDir::new(&enter)
+            .into_iter()
+            .filter_entry(move |e| {
+                e.depth() == 0
+                    || !e.file_type().is_dir()
+                    || scope.traverse(e.path().strip_prefix(&enter).unwrap_or(e.path()))
+            })
+            .filter(move |r| {
+                r.as_ref().map_or(true, |e| {
+                    e.file_type().is_file()
+                        && keep.contains(e.path().strip_prefix(&root).unwrap_or(e.path()))
+                })
+            })
+    }
     pub fn set_included(&mut self, dir: PathBuf, enabled: bool) {
-        let dir: PathBuf = if dir == Path::new(".") {
+        let dir = if dir == Path::new(".") {
             dir
         } else {
-            dir.components()
-                .filter(|c| *c != Component::CurDir)
-                .collect()
+            crate::paths::clean(&dir)
         };
         self.include.retain(|p| p != &dir);
         self.exclude.retain(|p| p != &dir);
@@ -105,19 +121,12 @@ pub struct Draft {
 pub fn path() -> PathBuf {
     crate::paths::config_dir().join("library.toml")
 }
-fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    match fs::read(path) {
-        Ok(b) => Ok(Some(b)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
-}
 impl Draft {
     pub fn load(root: &Path) -> Result<Self, String> {
         Self::at(path(), root)
     }
     fn at(path: PathBuf, root: &Path) -> Result<Self, String> {
-        let original = read(&path)?;
+        let original = crate::paths::read_opt(&path)?;
         let scope = if let Some(b) = &original {
             let mut saved: Saved =
                 toml::from_str(std::str::from_utf8(b).map_err(|e| e.to_string())?)
@@ -135,10 +144,7 @@ impl Draft {
                 .iter_mut()
                 .chain(&mut saved.scope.exclude)
             {
-                let normalized: PathBuf = path
-                    .components()
-                    .filter(|c| *c != Component::CurDir)
-                    .collect();
+                let normalized = crate::paths::clean(path);
                 *path = if normalized.as_os_str().is_empty() {
                     PathBuf::from(".")
                 } else {
@@ -158,45 +164,19 @@ impl Draft {
     }
     pub fn save(&mut self) -> Result<(), String> {
         self.scope.validate()?;
-        let parent = self
-            .path
-            .parent()
-            .ok_or("library configuration has no parent")?;
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let _lock = locking::sidecar(&self.path.with_extension("lock"))?;
-        if read(&self.path)? != self.original {
-            return Err(
-                "Folder selection changed in another window; reopen it before saving".into(),
-            );
-        }
         let bytes = toml::to_string_pretty(&Saved {
             root: self.root.clone(),
             scope: self.scope.clone(),
         })
         .map_err(|e| e.to_string())?
         .into_bytes();
-        let tmp = self
-            .path
-            .with_extension(format!("{}.tmp", std::process::id()));
-        let result = (|| -> Result<(), String> {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| e.to_string())?;
-            f.write_all(&bytes)
-                .and_then(|_| f.sync_all())
-                .map_err(|e| e.to_string())?;
-            fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
-            fs::File::open(parent)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| e.to_string())?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        result?;
+        crate::paths::save_guarded(
+            &self.path,
+            &self.path.with_extension("lock"),
+            &self.original,
+            &bytes,
+            "Folder selection changed in another window; reopen it before saving",
+        )?;
         self.original = Some(bytes);
         Ok(())
     }
@@ -276,6 +256,7 @@ pub fn run(c: &Cfg, args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[test]
     fn folder_boundaries_and_pruned_ancestors() {
         let s = Scope {

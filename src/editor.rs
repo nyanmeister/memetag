@@ -146,9 +146,8 @@ pub fn save(c: &Cfg, draft: &Draft) -> Result<FileRow, String> {
         .ok_or("Saved file missing from index".into())
 }
 
+use crate::widgets::Pending;
 use eframe::egui;
-use std::sync::mpsc;
-type Loaded = Result<(Draft, Vec<(String, u64, bool)>), String>;
 const NEXT_HELP: &str = "Save, then open the next file in these results with fewer than 3 hand-written tags (the Tagging assistant's untagged and thin tiers), continuing from this one. Ctrl+Enter.";
 
 pub enum Action {
@@ -163,8 +162,8 @@ pub enum Action {
 }
 pub struct EditorUi {
     draft: Option<Draft>,
-    load_rx: mpsc::Receiver<Loaded>,
-    save_rx: Option<mpsc::Receiver<Result<FileRow, String>>>,
+    load: Pending<(Draft, Vec<(String, u64, bool)>)>,
+    save: Pending<FileRow>,
     suggestions: Vec<(String, u64, bool)>,
     input: crate::widgets::TagInput,
     error: Option<String>,
@@ -181,19 +180,16 @@ pub struct EditorUi {
 
 impl EditorUi {
     pub fn new(c: Cfg, path: String, ctx: egui::Context) -> Self {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = load(&c, &path).map(|d| (d, crate::autocomplete::load(&c)));
-            let _ = tx.send(result);
-            ctx.request_repaint();
+        let loading = Pending::spawn(&ctx, move || {
+            load(&c, &path).map(|d| (d, crate::autocomplete::load(&c)))
         });
         // the tag field is the point of the card, so it has the keyboard as soon as the file is loaded
         let mut input = crate::widgets::TagInput::default();
         input.focus();
         Self {
             draft: None,
-            load_rx: rx,
-            save_rx: None,
+            load: loading,
+            save: Pending::default(),
             suggestions: vec![],
             input,
             error: None,
@@ -225,43 +221,31 @@ impl EditorUi {
         &mut self,
         ui: &mut egui::Ui,
         c: &Cfg,
-        thumb: Option<(egui::TextureId, egui::Vec2, u32)>,
+        thumb: Option<crate::widgets::Texture>,
     ) -> Action {
         let ctx = ui.ctx().clone();
         if self.draft.is_none() && self.error.is_none() {
-            match self.load_rx.try_recv() {
-                Ok(Ok((draft, suggestions))) => {
+            match self.load.poll(&ctx, "Editor loading stopped") {
+                Some(Ok((draft, suggestions))) => {
                     self.draft = Some(draft);
                     self.suggestions = suggestions;
                 }
-                Ok(Err(e)) => self.error = Some(e),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.error = Some("Editor loading stopped".into())
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(50))
-                }
+                Some(Err(e)) => self.error = Some(e),
+                None => {}
             }
         }
-        if let Some(rx) = &self.save_rx {
-            match rx.try_recv() {
-                Ok(Ok(row)) => return Action::Saved(Box::new(row), self.next),
-                Ok(Err(e)) => {
-                    self.error = Some(e);
-                    self.save_rx = None;
-                    self.next = false; // a later plain Save must not jump on (review, 2026-09-22)
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.error = Some("Saving stopped; reopen to check the file".into());
-                    self.save_rx = None;
-                    self.next = false;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(50))
-                }
+        match self
+            .save
+            .poll(&ctx, "Saving stopped; reopen to check the file")
+        {
+            Some(Ok(row)) => return Action::Saved(Box::new(row), self.next),
+            Some(Err(e)) => {
+                self.error = Some(e);
+                self.next = false; // a later plain Save must not jump on (review, 2026-09-22)
             }
+            None => {}
         }
-        let busy = self.save_rx.is_some();
+        let busy = self.save.busy();
         let mut action = Action::None;
         let mut save_clicked = false;
         let mut cancel = false;
@@ -329,8 +313,7 @@ impl EditorUi {
             // Salted per image so each edit opens at the top and never touches the grid's scroll position.
             egui::ScrollArea::vertical().id_salt(("editor", draft.path.as_str())).show(ui, |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
-                    if let Some((id, size, frames)) = thumb {
-                        let frame = egui::vec2(size.x / frames as f32, size.y);
+                    if let Some((id, frame, frames)) = thumb {
                         let scale = (200.0 / frame.x).min(160.0 / frame.y).min(1.0);
                         let image = egui::Image::from_texture(egui::load::SizedTexture::new(
                             id,
@@ -474,14 +457,8 @@ impl EditorUi {
                 }
                 let draft = draft.clone();
                 let c = c.clone();
-                let wake = ctx.clone();
-                let (tx, rx) = mpsc::channel();
-                self.save_rx = Some(rx);
+                self.save = Pending::spawn(&ctx, move || save(&c, &draft));
                 self.error = None;
-                std::thread::spawn(move || {
-                    let _ = tx.send(save(&c, &draft));
-                    wake.request_repaint();
-                });
             }
         }
         action
@@ -499,7 +476,6 @@ mod tests {
     fn tab_cycles_between_editor_text_fields_without_changing_ocr() {
         let c = Cfg::for_tests(&std::env::temp_dir().join("memetag-editor-focus"));
         let ctx = egui::Context::default();
-        let (_, load_rx) = mpsc::channel();
         let mut input = crate::widgets::TagInput::default();
         input.focus();
         let mut editor = EditorUi {
@@ -516,8 +492,8 @@ mod tests {
                 original_tags: BTreeSet::new(),
                 revision: vec![],
             }),
-            load_rx,
-            save_rx: None,
+            load: Pending::default(),
+            save: Pending::default(),
             suggestions: vec![],
             input,
             error: None,

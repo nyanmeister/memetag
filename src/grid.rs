@@ -11,6 +11,26 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const TILE: f32 = 200.0;
+/// between tiles, and between rows of them
+const GAP: f32 = 8.0;
+/// one row of the grid: a tile and the gap under it
+const STEP: f32 = TILE + GAP;
+/// How many tiles fit across `width`: as many as leave room for the gaps between them, at least one.
+fn columns(width: f32) -> usize {
+    ((width + GAP) / STEP).floor().max(1.0) as usize
+}
+/// The rows a viewport reaches, egui's `show_rows` way: the last row partly in view plus one of slack, and a band
+/// that runs off the end slides back so it keeps its length.
+fn rows_in(viewport: egui::Rect, rows: usize) -> (usize, usize) {
+    let mut first = (viewport.min.y / STEP).floor().max(0.0) as usize;
+    let mut last = (viewport.max.y / STEP).ceil() as usize + 1;
+    if last > rows {
+        let span = last.saturating_sub(first);
+        last = rows;
+        first = rows.saturating_sub(span);
+    }
+    (first, last)
+}
 /// finished decodes uploaded to the GPU per frame (a 5 MB strip uploads in ~1 ms; the decode itself is off-thread)
 const UPLOADS_PER_FRAME: usize = 4;
 /// a texture is only evictable after this many frames unseen, so the visible screen never thrashes
@@ -118,7 +138,7 @@ struct App {
     /// evaluated afresh whenever the rows change.
     last_ok: Option<query::Expr>,
     tex: HashMap<String, Option<Tex>>,
-    toast: Option<(String, Instant)>,
+    notice: Option<(String, Instant)>,
     first: bool,
     frame_no: u64,
     tex_bytes: usize,
@@ -127,6 +147,8 @@ struct App {
     res_rx: Option<mpsc::Receiver<Decoded>>,
     msg_tx: mpsc::Sender<Msg>,
     msg_rx: mpsc::Receiver<Msg>,
+    /// The window to wake when a thread has a message for it; a context of its own until `start_workers`.
+    wake: egui::Context,
     copying: bool,
     pulling: bool,
     ocr_done: HashSet<String>,
@@ -173,6 +195,8 @@ struct App {
     dedup_gen: u64,
     /// what the OCR card shows under each command it ran (keyed by the command text; `None` while it runs)
     ocr_runs: HashMap<&'static str, Option<String>>,
+    /// `MEMETAG_TRACE`: the UI pass's cost, one stderr line a second (frames, mean and worst `frame()` time).
+    trace: Option<(Instant, Duration, Duration, u32)>,
 }
 
 /// Key in `ocr_runs` for the service-state line the card fetches when it opens.
@@ -196,13 +220,14 @@ impl App {
             q: q.to_string(),
             msg_tx,
             msg_rx,
+            wake: egui::Context::default(),
             ocr_done,
             search_complete,
             err: None,
             hits: vec![],
             last_ok: None,
             tex: HashMap::new(),
-            toast: None,
+            notice: None,
             first: true,
             frame_no: 0,
             tex_bytes: 0,
@@ -236,24 +261,67 @@ impl App {
             propose: None,
             library_menu: None,
             dedup_gen: 0,
+            trace: std::env::var_os("MEMETAG_TRACE")
+                .map(|_| (Instant::now(), Duration::ZERO, Duration::ZERO, 0)),
         }
+    }
+    /// Under `MEMETAG_TRACE`, one line a second: UI passes run, their mean and worst cost (the egui pass only, not
+    /// the paint), and the sizes that drive it. A window with nothing to animate should show no frames at all.
+    fn trace_frame(&mut self, cost: Duration) {
+        let Some((since, sum, worst, n)) = self.trace.as_mut() else {
+            return;
+        };
+        *sum += cost;
+        *worst = (*worst).max(cost);
+        *n += 1;
+        let elapsed = since.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        eprintln!(
+            "trace: {n} frames in {:.1} s, ui pass mean {:.2} ms, worst {:.2} ms; {} hits of {} rows, {} textures",
+            elapsed.as_secs_f64(),
+            sum.as_secs_f64() * 1e3 / f64::from(*n),
+            worst.as_secs_f64() * 1e3,
+            self.hits.len(),
+            self.rows.len(),
+            self.tex.len()
+        );
+        self.trace = Some((Instant::now(), Duration::ZERO, Duration::ZERO, 0));
     }
     /// Derpibooru-style syntax card behind the ? button. Escape closes it before the window.
     fn show_help(&mut self, ctx: &egui::Context) {
-        let max = ctx.content_rect().size() - egui::vec2(40.0, 60.0);
-        egui::Window::new("Search syntax").open(&mut self.help_open).collapsible(false).resizable(true).vscroll(true)
-            .default_size(egui::vec2(800.0, 700.0).min(max)).max_size(max).show(ctx, |ui| {
-            egui::Grid::new("syntax-help").num_columns(2).spacing([24.0, 4.0]).striped(true).show(ui, |ui| {
-                for (example, meaning) in crate::query::SYNTAX_HELP {
-                    if example.is_empty() { ui.end_row(); ui.label(egui::RichText::new(*meaning).strong()); ui.end_row(); continue; }
-                    ui.label(egui::RichText::new(*example).monospace());
-                    ui.scope(|ui| { ui.set_max_width(620.0); ui.add(egui::Label::new(*meaning).wrap()); }); // long explanations wrap instead of widening the card
-                    ui.end_row();
-                }
-            });
-            ui.add_space(6.0);
-            ui.small("Fields and operators are case-insensitive. Syntax after derpibooru.org/pages/search_syntax.");
-        });
+        widgets::card(
+            ctx,
+            "Search syntax",
+            [800.0, 700.0],
+            true,
+            &mut self.help_open,
+            |ui| {
+                egui::Grid::new("syntax-help")
+                    .num_columns(2)
+                    .spacing([24.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (example, meaning) in crate::query::SYNTAX_HELP {
+                            if example.is_empty() {
+                                ui.end_row();
+                                ui.label(egui::RichText::new(*meaning).strong());
+                                ui.end_row();
+                                continue;
+                            }
+                            ui.label(egui::RichText::new(*example).monospace());
+                            ui.scope(|ui| {
+                                ui.set_max_width(620.0);
+                                ui.add(egui::Label::new(*meaning).wrap());
+                            }); // long explanations wrap instead of widening the card
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.small("Fields and operators are case-insensitive. Syntax after derpibooru.org/pages/search_syntax.");
+            },
+        );
     }
     /// How to run the OCR pass, behind the OCR button and the "awaiting OCR" count; the text comes from `ocr::help`.
     /// Every command has Run and Copy beside it; a quiet command's output lands under it, a long one opens a terminal.
@@ -261,127 +329,126 @@ impl App {
         if !self.ocr_help_open {
             return;
         }
-        let max = ctx.content_rect().size() - egui::vec2(40.0, 60.0);
         let sections = crate::ocr::help(&self.cfg, self.ocr_pending);
         let mut run: Option<(&'static str, crate::ocr::Run)> = None;
         let mut copy: Option<&'static str> = None;
         let mut open = self.ocr_help_open;
-        egui::Window::new("OCR")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .vscroll(true)
-            .default_size(egui::vec2(720.0, 620.0).min(max))
-            .max_size(max)
-            .show(ctx, |ui| {
-                for (heading, lines) in sections {
-                    ui.label(egui::RichText::new(heading).strong());
-                    ui.add_space(2.0);
-                    if heading.starts_with("With systemd") {
-                        match self.ocr_runs.get(SERVICE_STATE) {
-                            Some(Some(s)) => {
-                                ui.label(format!("memetag-ocr.service is {s}."));
-                            }
-                            _ => {
-                                ui.label("memetag-ocr.service: checking…");
-                            }
+        widgets::card(ctx, "OCR", [720.0, 620.0], true, &mut open, |ui| {
+            for (heading, lines) in sections {
+                ui.label(egui::RichText::new(heading).strong());
+                ui.add_space(2.0);
+                if heading.starts_with("With systemd") {
+                    match self.ocr_runs.get(SERVICE_STATE) {
+                        Some(Some(s)) => {
+                            ui.label(format!("memetag-ocr.service is {s}."));
+                        }
+                        _ => {
+                            ui.label("memetag-ocr.service: checking…");
                         }
                     }
-                    for line in lines {
-                        match line {
-                            crate::ocr::HelpLine::Text(t) => {
-                                ui.label(t);
-                            }
-                            crate::ocr::HelpLine::Cmd(c, how) => {
-                                let running = matches!(self.ocr_runs.get(c), Some(None));
-                                ui.horizontal(|ui| {
-                                    ui.code(c);
-                                    let hint = if how == crate::ocr::Run::Terminal {
-                                        "Open in a terminal window"
-                                    } else {
-                                        "Run now; the outcome shows below"
-                                    };
-                                    if ui
-                                        .add_enabled(!running, egui::Button::new("Run").small())
-                                        .on_hover_text(hint)
-                                        .clicked()
-                                    {
-                                        run = Some((c, how));
-                                    }
-                                    if ui
-                                        .add(egui::Button::new("Copy").small())
-                                        .on_hover_text("Copy the command")
-                                        .clicked()
-                                    {
-                                        copy = Some(c);
-                                    }
-                                    if running {
-                                        ui.spinner();
-                                    }
-                                });
-                                if let Some(Some(report)) = self.ocr_runs.get(c) {
-                                    ui.indent(c, |ui| {
-                                        ui.label(egui::RichText::new(report).monospace().weak());
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    ui.add_space(10.0);
                 }
-            });
+                for line in lines {
+                    match line {
+                        crate::ocr::HelpLine::Text(t) => {
+                            ui.label(t);
+                        }
+                        crate::ocr::HelpLine::Cmd(c, how) => {
+                            let running = matches!(self.ocr_runs.get(c), Some(None));
+                            ui.horizontal(|ui| {
+                                ui.code(c);
+                                let hint = if how == crate::ocr::Run::Terminal {
+                                    "Open in a terminal window"
+                                } else {
+                                    "Run now; the outcome shows below"
+                                };
+                                if ui
+                                    .add_enabled(!running, egui::Button::new("Run").small())
+                                    .on_hover_text(hint)
+                                    .clicked()
+                                {
+                                    run = Some((c, how));
+                                }
+                                if ui
+                                    .add(egui::Button::new("Copy").small())
+                                    .on_hover_text("Copy the command")
+                                    .clicked()
+                                {
+                                    copy = Some(c);
+                                }
+                                if running {
+                                    ui.spinner();
+                                }
+                            });
+                            if let Some(Some(report)) = self.ocr_runs.get(c) {
+                                ui.indent(c, |ui| {
+                                    ui.label(egui::RichText::new(report).monospace().weak());
+                                });
+                            }
+                        }
+                    }
+                }
+                ui.add_space(10.0);
+            }
+        });
         self.ocr_help_open = open;
         if let Some((cmd, how)) = run {
-            self.run_ocr_cmd(cmd, how, ctx);
+            self.run_ocr_cmd(cmd, how);
         }
         if let Some(cmd) = copy {
-            self.copy_text(cmd.to_string(), ctx);
+            self.copy_text(cmd.to_string());
         }
     }
+    /// Three seconds of green text under the search bar: something finished (see widgets.rs).
+    fn toast(&mut self, message: impl Into<String>) {
+        self.notice = Some((message.into(), Instant::now()));
+    }
+    /// Work on a thread whose outcome is a message for this window: the window is woken when it arrives.
+    fn spawn(&self, work: impl FnOnce() -> Option<Msg> + Send + 'static) {
+        let (tx, ctx) = (self.msg_tx.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            if let Some(m) = work() {
+                if tx.send(m).is_ok() {
+                    ctx.request_repaint();
+                }
+            }
+        });
+    }
     /// Run one card command. Quiet: on a thread, output back through `Msg::Ran`. Terminal: spawn and toast the terminal's name.
-    fn run_ocr_cmd(&mut self, cmd: &'static str, how: crate::ocr::Run, ctx: &egui::Context) {
+    fn run_ocr_cmd(&mut self, cmd: &'static str, how: crate::ocr::Run) {
         if how == crate::ocr::Run::Terminal {
-            self.toast = Some((
-                match crate::ocr::run_in_terminal(cmd) {
-                    Ok(t) => format!("Opened in {t}"),
-                    Err(e) => e,
-                },
-                Instant::now(),
-            ));
+            self.toast(match crate::ocr::run_in_terminal(cmd) {
+                Ok(t) => format!("Opened in {t}"),
+                Err(e) => e,
+            });
             return;
         }
         self.ocr_runs.insert(cmd, None);
-        let (tx, ctx) = (self.msg_tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
+        self.spawn(move || {
             let report = if cmd == SERVICE_STATE {
                 crate::ocr::service_state()
             } else {
                 crate::ocr::run_quiet(cmd)
             };
-            if tx.send(Msg::Ran { cmd, report }).is_ok() {
-                ctx.request_repaint();
-            }
+            Some(Msg::Ran { cmd, report })
         });
     }
     /// Text to the clipboard through our own owner, so it is still there after the window closes.
-    fn copy_text(&mut self, text: String, ctx: &egui::Context) {
+    fn copy_text(&mut self, text: String) {
         if text.is_empty() {
             return;
         }
-        let (tx, ctx) = (self.msg_tx.clone(), ctx.clone());
         let what = if text.contains('\n') || text.chars().count() > 40 {
             format!("Copied {} characters of text", text.chars().count())
         } else {
             format!("Copied \"{text}\"")
         };
-        std::thread::spawn(move || {
-            let message = match crate::clipboard::own_text("CLIPBOARD", &text) {
-                Ok(()) => what,
-                Err(e) => format!("Copy failed: {e}"),
-            };
-            if tx.send(Msg::Toast(message)).is_ok() {
-                ctx.request_repaint();
-            }
+        self.spawn(move || {
+            Some(Msg::Toast(
+                match crate::clipboard::own_text("CLIPBOARD", &text) {
+                    Ok(()) => what,
+                    Err(e) => format!("Copy failed: {e}"),
+                },
+            ))
         });
     }
     /// Open the editor on row `i` (Edit on hover, Shift+click, the Propose card's Edit, "next untagged").
@@ -395,14 +462,14 @@ impl App {
         let path = match self.cfg.file_path(&self.rows[index].path) {
             Ok(p) => p,
             Err(e) => {
-                self.toast = Some((e, Instant::now()));
+                self.toast(e);
                 return;
             }
         };
         let video = self.rows[index].kind == "video";
         let tx = self.msg_tx.clone();
         let ctx = ctx.clone();
-        self.toast = Some(("Opening original…".into(), Instant::now()));
+        self.toast("Opening original…");
         std::thread::spawn(move || {
             let report = |message: String| {
                 let _ = tx.send(Msg::Toast(message));
@@ -439,7 +506,6 @@ impl App {
             crate::implications::Action::Applied { vocab, changed } => {
                 let n = changed.len();
                 self.apply_vocab(
-                    ctx,
                     *vocab,
                     changed,
                     if n == 0 {
@@ -453,13 +519,13 @@ impl App {
     }
     /// Categories from the Tags card: vocab.toml as it is now (a hand edit or a pull since the window opened is
     /// kept), the entries changed, saved once, then absorbed and pushed like any other rule change.
-    fn set_categories(&mut self, ctx: &egui::Context, changes: &[(String, Option<String>)]) {
+    fn set_categories(&mut self, changes: &[(String, Option<String>)]) {
         let message = match changes {
             [(tag, Some(c))] => format!("\"{tag}\" is a {c}"),
             [(tag, None)] => format!("\"{tag}\" has no category"),
             _ => format!("Categories set on {} tags", changes.len()),
         };
-        self.edit_vocab(ctx, message, |v| {
+        self.edit_vocab(message, |v| {
             for (tag, category) in changes {
                 v.set_category(tag, category.as_deref());
                 if let Some(c) = category {
@@ -470,38 +536,29 @@ impl App {
     }
     /// Every vocabulary edit from the Tags card: vocab.toml as it is now, `edit` applied, saved once, then absorbed
     /// and pushed like any other rule change. A failure is a toast; the card keeps showing the saved state.
-    fn edit_vocab(
-        &mut self,
-        ctx: &egui::Context,
-        message: String,
-        edit: impl FnOnce(&mut crate::vocab::Vocab),
-    ) {
-        let mut next = match &self.cfg.vocab.path {
-            Some(p) => crate::vocab::Vocab::load(p),
-            None => self.cfg.vocab.clone(),
-        };
+    fn edit_vocab(&mut self, message: String, edit: impl FnOnce(&mut crate::vocab::Vocab)) {
+        let mut next = self.cfg.vocab_on_disk();
         edit(&mut next);
         match next.save() {
             Ok(()) => {
-                self.apply_vocab(ctx, next, vec![], message);
+                self.apply_vocab(next, vec![], message);
                 if let Some(card) = &mut self.tags_card {
                     card.follow(&self.cfg.vocab);
                 }
             }
-            Err(e) => self.toast = Some((format!("Not saved: {e}"), Instant::now())),
+            Err(e) => self.toast(format!("Not saved: {e}")),
         }
     }
     /// A locally saved vocabulary (an Implications Add or remove, a Tags rename): take the rules over, refresh what
     /// shows them, then push them to the server so every machine gets the change (a conflict raises the resolve card).
     fn apply_vocab(
         &mut self,
-        ctx: &egui::Context,
         vocab: crate::vocab::Vocab,
         changed: Vec<(String, std::collections::BTreeSet<String>)>,
         message: String,
     ) {
         self.absorb_vocab(vocab, changed, message);
-        self.push_vocab_async(ctx);
+        self.push_vocab_async();
     }
     /// Fold a vocabulary and the rows `Db::reimply` changed into the open window, without pushing. Shared by the local
     /// edits (through `apply_vocab`) and by a conflict resolution that already settled with the server.
@@ -512,16 +569,13 @@ impl App {
         message: String,
     ) {
         self.cfg.vocab = vocab;
-        let by_path: HashMap<String, usize> = self
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (r.path.clone(), i))
+        let by_path = crate::index::by_path(&self.rows);
+        let changed: Vec<(usize, _)> = changed
+            .into_iter()
+            .filter_map(|(p, tags)| by_path.get(p.as_str()).map(|&i| (i, tags)))
             .collect();
-        for (p, tags) in changed {
-            if let Some(&i) = by_path.get(&p) {
-                self.rows[i].tags = tags;
-            }
+        for (i, tags) in changed {
+            self.rows[i].tags = tags;
         }
         if let Some(im) = &mut self.implications {
             // an open card shows its own copy of the rules; a rename or a pull behind its back must reach it
@@ -530,49 +584,38 @@ impl App {
         }
         self.search_complete = crate::search_complete::SearchComplete::new(&self.cfg, &self.rows);
         self.refilter();
-        self.toast = Some((message, Instant::now()));
+        self.toast(message);
     }
     /// After a local rule edit, push it to the server on a thread. A clean push (or a seed) is silent — the Save
     /// already toasted. A conflict comes back as `Msg::VocabConflict`, a transport failure as a toast.
-    fn push_vocab_async(&self, ctx: &egui::Context) {
+    fn push_vocab_async(&self) {
         let Ok(Some(store)) = crate::vocabsync::store_for(&self.cfg) else {
             return; // a local root, or no [pull_remote]: nothing to push to
         };
-        let (tx, ctx) = (self.msg_tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
+        self.spawn(move || {
             let env = crate::vocabsync::Env::from_home();
-            let msg = match crate::vocabsync::sync(&store, &env) {
+            match crate::vocabsync::sync(&store, &env) {
                 Ok(crate::vocabsync::Outcome::Conflict(cf)) => Some(Msg::VocabConflict(*cf)),
                 Ok(crate::vocabsync::Outcome::Pulled) => Some(Msg::VocabRefresh),
                 Ok(_) => None,
                 Err(e) => Some(Msg::Toast(format!(
                     "vocab: your rules were saved but not synced to the server ({e})"
                 ))),
-            };
-            if let Some(m) = msg {
-                if tx.send(m).is_ok() {
-                    ctx.request_repaint();
-                }
             }
         });
     }
     /// Carry a conflict resolution out on a thread (ssh write, then reimply if the local file changed) and fold the
     /// result back through `Msg::VocabResolved`.
-    fn resolve_vocab_async(
-        &self,
-        resolution: crate::vocabconflict::Resolution,
-        ctx: &egui::Context,
-    ) {
+    fn resolve_vocab_async(&self, resolution: crate::vocabconflict::Resolution) {
         let Ok(Some(store)) = crate::vocabsync::store_for(&self.cfg) else {
             return;
         };
-        let (tx, ctx, db) = (self.msg_tx.clone(), ctx.clone(), self.cfg.db.clone());
-        std::thread::spawn(move || {
+        let db = self.cfg.db.clone();
+        self.spawn(move || {
             let env = crate::vocabsync::Env::from_home();
-            let res = crate::vocabconflict::resolve(&store, &env, &db, resolution);
-            if tx.send(Msg::VocabResolved(res)).is_ok() {
-                ctx.request_repaint();
-            }
+            Some(Msg::VocabResolved(crate::vocabconflict::resolve(
+                &store, &env, &db, resolution,
+            )))
         });
     }
     /// Open the resolve card on a conflict, or refresh it if one is already up, and point the user at it.
@@ -581,10 +624,7 @@ impl App {
             Some(card) => card.update(cf),
             None => self.vocab_conflict = Some(crate::vocabconflict::VocabConflictUi::new(cf)),
         }
-        self.toast = Some((
-            "Rules differ from the server — resolve in the card".into(),
-            Instant::now(),
-        ));
+        self.toast("Rules differ from the server — resolve in the card");
     }
     /// The vocab conflict resolve card, when one is up.
     fn show_vocab_conflict(&mut self, ctx: &egui::Context) {
@@ -594,21 +634,17 @@ impl App {
         match card.show(ctx) {
             crate::vocabconflict::Action::None => {}
             crate::vocabconflict::Action::Close => self.vocab_conflict = None,
-            crate::vocabconflict::Action::Resolve(r) => self.resolve_vocab_async(r, ctx),
+            crate::vocabconflict::Action::Resolve(r) => self.resolve_vocab_async(r),
         }
     }
     /// The files no longer carry `from`: update rules and aliases that mention it to say `to`. Reads vocab.toml afresh
     /// so rules edited by hand since the window opened survive, as the Implications card does; the file goes first,
     /// then the index, the same order as that card's Add.
-    fn finish_rename(&mut self, ctx: &egui::Context, from: &str, to: &str) {
-        let mut vocab = match &self.cfg.vocab.path {
-            Some(p) => crate::vocab::Vocab::load(p),
-            None => self.cfg.vocab.clone(),
-        };
+    fn finish_rename(&mut self, from: &str, to: &str) {
+        let mut vocab = self.cfg.vocab_on_disk();
         if let Some(e) = &vocab.broken {
-            self.toast = Some((
-                format!("Rules still mention \"{from}\": vocab.toml did not parse ({e})"),
-                Instant::now(),
+            self.toast(format!(
+                "Rules still mention \"{from}\": vocab.toml did not parse ({e})"
             ));
             return;
         }
@@ -624,17 +660,10 @@ impl App {
                 renamed.not_carried.join(", ")
             )
         };
-        let applied = vocab.save().and_then(|_| {
-            Db::open_cfg(&self.cfg).and_then(|db| {
-                db.reimply(&vocab)
-                    .map_err(|e| format!("vocab.toml saved, but the index was not updated: {e}"))
-            })
-        });
-        match applied {
+        match crate::index::save_rules(&self.cfg, &mut vocab) {
             Ok(changed) => {
                 let n = changed.len();
                 self.apply_vocab(
-                    ctx,
                     vocab,
                     changed,
                     format!(
@@ -643,10 +672,7 @@ impl App {
                 );
             }
             Err(e) => {
-                self.toast = Some((
-                    format!("Rules still mention \"{from}\": {e}"),
-                    Instant::now(),
-                ));
+                self.toast(format!("Rules still mention \"{from}\": {e}"));
             }
         }
     }
@@ -662,20 +688,14 @@ impl App {
         if self.search_complete.dismiss(&self.q) {
             return;
         }
-        if let Some(im) = &mut self.implications {
-            im.request_close();
+        if self.implications.take().is_some() {
             return;
         }
         if let Some(t) = &mut self.tags_card {
-            t.request_close();
+            t.request_close(); // a tint still settling is written first; the card closes on the next frame
             return;
         }
-        if let Some(p) = &mut self.propose {
-            p.request_close();
-            return;
-        }
-        if let Some(d) = &mut self.dedup {
-            d.request_close();
+        if self.propose.take().is_some() || self.dedup.take().is_some() {
             return;
         }
         if self.ocr_help_open {
@@ -688,10 +708,10 @@ impl App {
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
-    fn toggle_ocr_help(&mut self, ctx: &egui::Context) {
+    fn toggle_ocr_help(&mut self) {
         self.ocr_help_open = !self.ocr_help_open;
         if self.ocr_help_open {
-            self.run_ocr_cmd(SERVICE_STATE, crate::ocr::Run::Quiet, ctx);
+            self.run_ocr_cmd(SERVICE_STATE, crate::ocr::Run::Quiet);
         }
     }
     fn budget(&self) -> usize {
@@ -733,16 +753,12 @@ impl App {
         self.res_rx = Some(res_rx);
     }
     fn start_workers(&mut self, ctx: egui::Context) {
+        self.wake = ctx.clone();
         self.start_decode_workers(ctx.clone());
         // the merge with the server runs beside the window, not before it; the outcome lands through the message channel
-        let (tx, ctx2, cfg) = (self.msg_tx.clone(), ctx.clone(), self.cfg.clone());
+        let cfg = self.cfg.clone();
         self.pulling = true;
-        std::thread::spawn(move || {
-            let o = crate::pull::for_grab(&cfg);
-            if tx.send(Msg::Pulled(o)).is_ok() {
-                ctx2.request_repaint();
-            }
-        });
+        self.spawn(move || Some(Msg::Pulled(crate::pull::for_grab(&cfg))));
         // the OCR service writes the index while the window is open: refresh the done-set every 15 s so badges fall off as it works
         let (tx, ctx, db) = (self.msg_tx.clone(), ctx.clone(), self.cfg.db.clone());
         std::thread::spawn(move || loop {
@@ -767,7 +783,7 @@ impl App {
         let db = match Db::open_cfg(&self.cfg) {
             Ok(d) => d,
             Err(e) => {
-                self.toast = Some((format!("pull: {e}"), Instant::now()));
+                self.toast(format!("pull: {e}"));
                 return;
             }
         };
@@ -828,10 +844,7 @@ impl App {
         if !o.gone.is_empty() {
             parts.push(format!("{} gone", o.gone.len()));
         }
-        self.toast = Some((
-            format!("Pulled from the server: {}", parts.join(", ")),
-            Instant::now(),
-        ));
+        self.toast(format!("Pulled from the server: {}", parts.join(", ")));
     }
     /// Read current state when consuming the message, not its potentially stale worker snapshot.
     /// Reapply here as well: a previous pull may have saved the rules then failed to update SQLite.
@@ -858,7 +871,7 @@ impl App {
             Ok((vocab, tags)) => {
                 self.absorb_vocab(vocab, tags, "Rules refreshed from the server".into())
             }
-            Err(e) => self.toast = Some((format!("Rules refresh failed: {e}"), Instant::now())),
+            Err(e) => self.toast(format!("Rules refresh failed: {e}")),
         }
     }
     fn awaits_ocr(&self, i: usize) -> bool {
@@ -913,10 +926,7 @@ impl App {
         match next {
             Some(i) => self.edit(i, ctx),
             None => {
-                self.toast = Some((
-                    "Nothing left to tag in these results".into(),
-                    Instant::now(),
-                ));
+                self.toast("Nothing left to tag in these results");
             }
         }
     }
@@ -966,6 +976,18 @@ impl App {
         }
     }
     fn refilter(&mut self) {
+        let found = self.search();
+        let ok = found.is_some();
+        self.hits = found.unwrap_or_default();
+        self.recount_ocr();
+        self.recount_tagged();
+        if ok && self.dedup.is_some() {
+            self.compute_dupes();
+        }
+    }
+    /// The rows the query selects, in the grid's order; `None` when there is nothing to show yet: the first
+    /// query is broken, a source in it is unknown, or the hashes a similar: search needs are still being made.
+    fn search(&mut self) -> Option<Vec<usize>> {
         let mut expr = match query::parse(&self.q) {
             Ok(e) => {
                 self.err = None;
@@ -977,33 +999,19 @@ impl App {
                 // The last query that parsed keeps its results while this one is typed, evaluated afresh: a pull
                 // can reorder or shrink the rows meanwhile, and hit indices kept from before pointed at other tiles,
                 // or past the end (review, 2026-09-22).
-                match &self.last_ok {
-                    Some(e) => e.clone(),
-                    None => {
-                        self.hits.clear();
-                        self.recount_ocr();
-                        self.recount_tagged();
-                        return;
-                    }
-                }
+                self.last_ok.clone()?
             }
         };
         if let Err(e) = crate::sources::resolve_query(&self.cfg, &mut expr) {
             self.err = Some(e);
-            self.hits.clear();
-            self.recount_ocr();
-            self.recount_tagged();
-            return;
+            return None;
         }
         let v = &self.cfg.vocab;
         let alias = |t: &str| v.canon(t);
         let wanted = query::similar_terms(&expr);
         if !wanted.is_empty() && self.similar.is_none() {
-            self.hits.clear();
             self.start_hashing();
-            self.recount_ocr();
-            self.recount_tagged();
-            return;
+            return None;
         }
         if let Some(l) = &mut self.similar {
             if let Some(e) = l.prepare(&wanted).into_iter().next() {
@@ -1026,12 +1034,7 @@ impl App {
             // the assistant puts the work first: fewest hand-written tags, newest first within a count (stable)
             hits.sort_by_key(|&i| self.rows[i].xmp_tag_count);
         }
-        self.hits = hits;
-        self.recount_ocr();
-        self.recount_tagged();
-        if self.dedup.is_some() {
-            self.compute_dupes();
-        }
+        Some(hits)
     }
     /// Fill the perceptual-hash cache on a thread (the first similar: query of a launch; seconds from the local thumbnails).
     fn start_hashing(&mut self) {
@@ -1039,15 +1042,12 @@ impl App {
             return;
         }
         self.hashing = true;
-        self.toast = Some((
-            "Image search: hashing thumbnails, the results follow in a moment…".into(),
-            Instant::now(),
-        ));
-        let (tx, cfg, rows) = (self.msg_tx.clone(), self.cfg.clone(), self.rows.clone());
-        std::thread::spawn(move || {
-            let r =
-                Db::open_cfg(&cfg).and_then(|db| crate::similar::ensure(&cfg, &db, &rows, false));
-            let _ = tx.send(Msg::Hashed(r));
+        self.toast("Image search: hashing thumbnails, the results follow in a moment…");
+        let (cfg, rows) = (self.cfg.clone(), self.rows.clone());
+        self.spawn(move || {
+            Some(Msg::Hashed(Db::open_cfg(&cfg).and_then(|db| {
+                crate::similar::ensure(&cfg, &db, &rows, false)
+            })))
         });
     }
     /// The search becomes "files that look like this tile"; the path is quoted so parentheses and commas in it stay literal.
@@ -1079,8 +1079,8 @@ impl App {
             .filter_map(|r| lookup.hash(&r.path).map(|h| (r.path.clone(), h.clone())))
             .collect();
         self.dedup_gen += 1;
-        let (gen, scope, tx) = (self.dedup_gen, self.hits.len(), self.msg_tx.clone());
-        std::thread::spawn(move || {
+        let (gen, scope) = (self.dedup_gen, self.hits.len());
+        self.spawn(move || {
             let groups = crate::similar::groups(
                 &items.iter().map(|(_, h)| h.clone()).collect::<Vec<_>>(),
                 crate::similar::DEFAULT_DISTANCE,
@@ -1089,7 +1089,7 @@ impl App {
                 .into_iter()
                 .map(|g| g.into_iter().map(|i| items[i].0.clone()).collect())
                 .collect();
-            let _ = tx.send(Msg::Grouped { gen, groups, scope });
+            Some(Msg::Grouped { gen, groups, scope })
         });
     }
     fn show_tags_card(&mut self, ctx: &egui::Context) {
@@ -1099,27 +1099,26 @@ impl App {
         match card.show(ctx, &self.cfg) {
             crate::tags_card::Action::None => {}
             crate::tags_card::Action::Close => self.tags_card = None,
-            crate::tags_card::Action::Categories(changes) => self.set_categories(ctx, &changes),
+            crate::tags_card::Action::Categories(changes) => self.set_categories(&changes),
             crate::tags_card::Action::Color(c, rgb) => {
                 let message = match rgb {
                     Some(rgb) => format!("{c} is tinted {}", crate::vocab::hex(rgb)),
                     None => format!("{c} wears its own tint again"),
                 };
-                self.edit_vocab(ctx, message, |v| v.set_color(&c, rgb));
+                self.edit_vocab(message, |v| v.set_color(&c, rgb));
             }
             crate::tags_card::Action::AddCategory(c) => {
-                self.edit_vocab(ctx, format!("New category: {c}"), |v| {
+                self.edit_vocab(format!("New category: {c}"), |v| {
                     v.ensure_color(&c);
                 });
             }
             crate::tags_card::Action::RenameCategory(from, to) => {
-                self.edit_vocab(ctx, format!("Category \"{from}\" is now \"{to}\""), |v| {
+                self.edit_vocab(format!("Category \"{from}\" is now \"{to}\""), |v| {
                     v.rename_category(&from, &to);
                 });
             }
             crate::tags_card::Action::RemoveCategory(c) => {
                 self.edit_vocab(
-                    ctx,
                     format!("Category \"{c}\" removed; its tags have none"),
                     |v| {
                         v.remove_category(&c);
@@ -1144,22 +1143,14 @@ impl App {
         let Some(mut card) = self.propose.take() else {
             return;
         };
-        let textures: HashMap<usize, (egui::TextureId, egui::Vec2, u32)> = card
-            .visible()
-            .into_iter()
-            .filter_map(|i| {
-                self.texture(i).map(|(tid, frames, _, size)| {
-                    (i, (tid, egui::vec2(size.x / frames as f32, size.y), frames))
-                })
-            })
-            .collect();
+        let textures = self.textures(card.visible());
         let action = card.show(ctx, &self.rows, &textures);
         self.propose = Some(card);
         match action {
             crate::propose_card::Action::Close => self.propose = None,
             crate::propose_card::Action::None => {}
             crate::propose_card::Action::Open(i) => self.open_external(i, ctx),
-            crate::propose_card::Action::Copy(i) => self.copy(i, false, ctx),
+            crate::propose_card::Action::Copy(i) => self.copy(i, false),
             crate::propose_card::Action::Edit(i) => self.edit(i, ctx),
             crate::propose_card::Action::Apply {
                 tag,
@@ -1171,7 +1162,7 @@ impl App {
                     if let Err(e) = Db::open_cfg(&self.cfg)
                         .and_then(|db| crate::propose::reject(&db, &tag, &reject))
                     {
-                        self.toast = Some((format!("Rejections not saved: {e}"), Instant::now()));
+                        self.toast(format!("Rejections not saved: {e}"));
                     }
                 }
                 self.propose = None;
@@ -1192,15 +1183,7 @@ impl App {
         let Some(mut card) = self.dedup.take() else {
             return;
         };
-        let textures: HashMap<usize, (egui::TextureId, egui::Vec2, u32)> = card
-            .visible()
-            .into_iter()
-            .filter_map(|i| {
-                self.texture(i).map(|(tid, frames, _, size)| {
-                    (i, (tid, egui::vec2(size.x / frames as f32, size.y), frames))
-                })
-            })
-            .collect();
+        let textures = self.textures(card.visible());
         let action = card.show(ctx, &self.rows, &self.selected, &textures);
         // back in place before the action runs: "Show in grid" refilters, and the regrouping only happens for a
         // card that is there to see it (review, 2026-09-22: it kept the previous search's groups)
@@ -1223,6 +1206,18 @@ impl App {
         if !self.pending.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+    }
+    /// The textures of the rows a card draws this frame, by row, each as one frame's size; a missing one is queued
+    /// for decoding, as on the grid.
+    fn textures(&mut self, visible: Vec<usize>) -> HashMap<usize, widgets::Texture> {
+        visible
+            .into_iter()
+            .filter_map(|i| self.frame_texture(i).map(|t| (i, t)))
+            .collect()
+    }
+    fn frame_texture(&mut self, i: usize) -> Option<widgets::Texture> {
+        self.texture(i)
+            .map(|(tid, frames, _, size)| (tid, egui::vec2(size.x / frames as f32, size.y), frames))
     }
     /// The tile's texture if it is ready; otherwise queue one decode for it and return None (the cell draws empty).
     fn texture(&mut self, i: usize) -> Option<(egui::TextureId, u32, f64, egui::Vec2)> {
@@ -1270,27 +1265,25 @@ impl App {
     }
     /// Clipboard work (read the original over the mount, maybe re-encode, hand to xclip) runs on its own thread;
     /// the result comes back as `Msg::Copied`, and copy-and-close closes the window only after a successful copy.
-    fn copy(&mut self, i: usize, close: bool, ctx: &egui::Context) {
+    fn copy(&mut self, i: usize, close: bool) {
         if self.copying {
             return;
         }
         let target = match self.cfg.file_path(&self.rows[i].path) {
             Ok(p) => p,
             Err(e) => {
-                self.toast = Some((e, Instant::now()));
+                self.toast(e);
                 return;
             }
         };
-        let (tx, ctx) = (self.msg_tx.clone(), ctx.clone());
         self.copying = true;
-        self.toast = Some(("Copying…".into(), Instant::now()));
-        std::thread::spawn(move || {
+        self.toast("Copying…");
+        self.spawn(move || {
             let (ok, message) = match grab::clip_path(&target) {
                 Ok((n, m)) => (true, format!("Copied {n} as {m}")),
                 Err(e) => (false, format!("Copy failed: {e}")),
             };
-            let _ = tx.send(Msg::Copied { ok, close, message });
-            ctx.request_repaint();
+            Some(Msg::Copied { ok, close, message })
         });
     }
 }
@@ -1311,7 +1304,9 @@ impl eframe::App for App {
     }
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
         self.popup_open = egui::Popup::is_any_open(ui.ctx());
+        let started = Instant::now();
         ui.add_enabled_ui(self.library_menu.is_none(), |ui| self.frame(ui));
+        self.trace_frame(started.elapsed());
         if let Some(menu) = &mut self.library_menu {
             match menu.show(ui.ctx()) {
                 crate::library_ui::Action::None => {}
@@ -1325,12 +1320,8 @@ impl eframe::App for App {
                     self.dedup_gen += 1;
                     self.start_decode_workers(ui.ctx().clone());
                     let c = self.cfg.clone();
-                    let tx = self.msg_tx.clone();
-                    let ctx = ui.ctx().clone();
-                    std::thread::spawn(move || {
-                        let result = Db::open_cfg(&c).and_then(|db| db.all());
-                        let _ = tx.send(Msg::LibraryRows(result));
-                        ctx.request_repaint();
+                    self.spawn(move || {
+                        Some(Msg::LibraryRows(Db::open_cfg(&c).and_then(|db| db.all())))
                     });
                 }
             }
@@ -1359,7 +1350,7 @@ impl eframe::App for App {
             })
         });
         if let Some(t) = copied {
-            self.copy_text(t, &ctx);
+            self.copy_text(t);
         }
     }
 }
@@ -1371,6 +1362,16 @@ impl App {
         self.frame_no += 1;
         self.pump(ctx);
         while let Ok(m) = self.msg_rx.try_recv() {
+            // the editor and the batch view hold row indices: an outcome that reshuffles the rows waits in the
+            // channel until they close
+            let reshuffles = matches!(
+                m,
+                Msg::Pulled(_) | Msg::VocabRefresh | Msg::VocabResolved(_)
+            );
+            if reshuffles && (self.editing.is_some() || self.batch.is_some()) {
+                let _ = self.msg_tx.send(m);
+                break;
+            }
             match m {
                 Msg::LibraryRows(result) => match result {
                     Ok(rows) => {
@@ -1383,14 +1384,14 @@ impl App {
                         self.similar = None;
                         self.search_complete.refresh(&self.rows);
                         self.refilter();
-                        self.toast = Some(("Folder selection saved".into(), Instant::now()));
+                        self.toast("Folder selection saved");
                     }
-                    Err(e) => self.toast = Some((e, Instant::now())),
+                    Err(e) => self.toast(e),
                 },
-                Msg::Toast(s) => self.toast = Some((s, Instant::now())),
+                Msg::Toast(s) => self.toast(s),
                 Msg::Copied { ok, close, message } => {
                     self.copying = false;
-                    self.toast = Some((message, Instant::now()));
+                    self.toast(message);
                     if ok && close {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -1402,16 +1403,11 @@ impl App {
                 Msg::Ran { cmd, report } => {
                     self.ocr_runs.insert(cmd, Some(report));
                     if cmd != SERVICE_STATE {
-                        self.run_ocr_cmd(SERVICE_STATE, crate::ocr::Run::Quiet, ctx);
+                        self.run_ocr_cmd(SERVICE_STATE, crate::ocr::Run::Quiet);
                     }
                 }
-                // the editor and the batch view hold row indices: let the outcome wait in the channel until they are closed
                 Msg::Pulled(mut o) => {
                     self.pulling = false;
-                    if self.editing.is_some() || self.batch.is_some() {
-                        let _ = self.msg_tx.send(Msg::Pulled(o));
-                        break;
-                    }
                     let conflict = o.vocab_conflict.take();
                     self.apply_pull(o);
                     if let Some(cf) = conflict {
@@ -1419,27 +1415,17 @@ impl App {
                     }
                 }
                 Msg::VocabConflict(cf) => self.raise_vocab_conflict(cf),
-                Msg::VocabRefresh => {
-                    if self.editing.is_some() || self.batch.is_some() {
-                        let _ = self.msg_tx.send(Msg::VocabRefresh);
-                        break;
-                    }
-                    self.refresh_vocab();
-                }
+                Msg::VocabRefresh => self.refresh_vocab(),
                 Msg::VocabResolved(r) => {
-                    if self.editing.is_some() || self.batch.is_some() {
-                        let _ = self.msg_tx.send(Msg::VocabResolved(r));
-                        break;
-                    }
                     self.vocab_conflict = None;
                     match r {
                         Ok(res) => match res.fold {
                             Some(_) => {
                                 self.refresh_vocab();
                             }
-                            None => self.toast = Some((res.message, Instant::now())),
+                            None => self.toast(res.message),
                         },
-                        Err(e) => self.toast = Some((format!("vocab: {e}"), Instant::now())),
+                        Err(e) => self.toast(format!("vocab: {e}")),
                     }
                 }
                 Msg::Hashed(r) => {
@@ -1452,7 +1438,7 @@ impl App {
                                 self.compute_dupes();
                             }
                         }
-                        Err(e) => self.toast = Some((format!("Image search: {e}"), Instant::now())),
+                        Err(e) => self.toast(format!("Image search: {e}")),
                     }
                 }
                 Msg::Grouped { gen, groups, scope } => {
@@ -1495,35 +1481,27 @@ impl App {
                         if !as_planned {
                             // the plan is editable in the batch panel; whatever it became, it is no longer a rename
                             if !succeeded.is_empty() {
-                                self.toast = Some((
-                                    format!(
-                                        "The plan was changed, so rules still mention \"{from}\""
-                                    ),
-                                    Instant::now(),
+                                self.toast(format!(
+                                    "The plan was changed, so rules still mention \"{from}\""
                                 ));
                             }
                         } else if succeeded.len() == planned {
-                            self.finish_rename(ctx, &from, &to);
+                            self.finish_rename(&from, &to);
                         } else if !succeeded.is_empty() {
-                            self.toast = Some((
-                                format!(
-                                    "Some files still carry \"{from}\"; the rules follow once a rename reaches them all"
-                                ),
-                                Instant::now(),
+                            self.toast(format!(
+                                "Some files still carry \"{from}\"; the rules follow once a rename reaches them all"
                             ));
                         }
                     }
                     if let Some(t) = &mut self.tags_card {
-                        t.reload(&self.cfg);
+                        t.reload(&self.cfg, ctx);
                     }
                 }
             }
             return;
         }
         if let Some(index) = self.editing.as_ref().map(|(i, _)| *i) {
-            let thumb = self
-                .texture(index)
-                .map(|(id, frames, _, size)| (id, size, frames));
+            let thumb = self.frame_texture(index);
             let action = self.editing.as_mut().unwrap().1.show(ui, &self.cfg, thumb);
             match action {
                 crate::editor::Action::None => {}
@@ -1538,7 +1516,7 @@ impl App {
                     if let Some(p) = &mut self.propose {
                         p.remap(&self.rows); // a file that now carries the tag leaves the proposals
                     }
-                    self.toast = Some(("Saved tags and text".into(), Instant::now()));
+                    self.toast("Saved tags and text");
                     if next {
                         self.open_next(index, slot, ctx);
                     }
@@ -1577,12 +1555,12 @@ impl App {
                     if ui.add_enabled(self.editing.is_none() && self.batch.is_none() && !self.pulling, egui::Button::new("Folders")).clicked() {
                         match crate::library_ui::LibraryUi::new(&self.cfg) {
                             Ok(menu) => self.library_menu = Some(menu),
-                            Err(e) => self.toast = Some((e, Instant::now())),
+                            Err(e) => self.toast(e),
                         }
                     }
                     if ui.selectable_label(self.help_open,
  "?").on_hover_text("Search syntax").clicked() { self.help_open = !self.help_open; }
-                    if ui.selectable_label(self.ocr_help_open, "OCR").on_hover_text("How to run the text-reading pass").clicked() { self.toggle_ocr_help(ctx); }
+                    if ui.selectable_label(self.ocr_help_open, "OCR").on_hover_text("How to run the text-reading pass").clicked() { self.toggle_ocr_help(); }
                     if ui.button("📷").on_hover_text("Search for the image on the clipboard (similar:clipboard)").clicked() { self.search_clipboard(); }
                     let (changed, copy) = self.search_complete.show(ui, &self.cfg, &mut self.q, &mut self.first);
                     if changed { self.refilter(); } copy_first = copy;
@@ -1593,11 +1571,11 @@ impl App {
                     Some(e) => { ui.colored_label(widgets::ERROR, format!("query: {e}")); }
                     None => {
                         ui.label(format!("{} of {} files", self.hits.len(), self.rows.len()));
-                        if self.ocr_pending > 0 { ui.label("·"); if ui.link(format!("{} awaiting OCR", self.ocr_pending)).on_hover_text("How to run the text-reading pass").clicked() { self.toggle_ocr_help(ctx); } }
+                        if self.ocr_pending > 0 { ui.label("·"); if ui.link(format!("{} awaiting OCR", self.ocr_pending)).on_hover_text("How to run the text-reading pass").clicked() { self.toggle_ocr_help(); } }
                         ui.label(format!("· previews up to {} frames, native speed capped at {} fps · textures {} MB of {}", self.cfg.strip_frames, self.cfg.preview_fps, self.tex_bytes / (1024 * 1024), self.cfg.texture_budget_mb));
                     }
                 }
-                if let Some((msg, t)) = &self.toast { if t.elapsed() < Duration::from_secs(3) { ui.separator(); ui.colored_label(widgets::OK, msg); } }
+                if let Some((msg, t)) = &self.notice { if t.elapsed() < Duration::from_secs(3) { ui.separator(); ui.colored_label(widgets::OK, msg); } }
             });
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.select_mode, "Select").on_hover_text("Select mode: left-click toggles selection. Shift+middle-click works in either mode.");
@@ -1618,10 +1596,10 @@ impl App {
                 } else { ui.small("Shift+middle-click to select"); }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.selectable_label(self.implications.is_some(), "Implications").on_hover_text("Rules like \"twitter post ⇒ twitter\": a general tag every file with a specific one gets for free").clicked() {
-                        match self.implications.take() { Some(mut im) => { im.request_close(); self.implications = Some(im); } None => self.implications = Some(crate::implications::ImplicationsUi::new(&self.cfg, &self.rows)) }
+                        if self.implications.take().is_none() { self.implications = Some(crate::implications::ImplicationsUi::new(&self.cfg, &self.rows, ctx)); }
                     }
                     if ui.selectable_label(self.dedup.is_some(), "Duplicates").on_hover_text("The search results grouped by look-alikes, side by side: copies, other sizes, captioned versions").clicked() {
-                        match self.dedup.take() { Some(mut d) => { d.request_close(); self.dedup = Some(d); } None => { self.dedup = Some(crate::dedup::DedupUi::new()); self.compute_dupes(); } }
+                        if self.dedup.take().is_none() { self.dedup = Some(crate::dedup::DedupUi::new()); self.compute_dupes(); }
                     }
                     if ui
                         .selectable_label(self.tags_card.is_some(), "Tags")
@@ -1633,7 +1611,7 @@ impl App {
                                 t.request_close();
                                 self.tags_card = Some(t);
                             }
-                            None => self.tags_card = Some(crate::tags_card::TagsUi::new(&self.cfg)),
+                            None => self.tags_card = Some(crate::tags_card::TagsUi::new(&self.cfg, ctx)),
                         }
                     }
                     if ui.toggle_value(&mut self.assist, "Tagging assistant").on_hover_text(format!("How much of the collection carries tags you wrote. Untagged tiles get an orange outline, thinly tagged ones (fewer than {} tags) a yellow one, tagged ones dim, and the results go fewest tags first. Folder and implied tags do not count.", self.thin_below)).changed() { reorder = true; }
@@ -1683,7 +1661,7 @@ impl App {
         }
         if copy_first {
             if let Some(&i) = self.hits.first() {
-                self.copy(i, false, ctx);
+                self.copy(i, false);
             }
         }
         self.show_help(ctx);
@@ -1705,11 +1683,20 @@ impl App {
             let page_height = (ui.available_height() - 32.0).max(TILE);
             // Own id: the editor and batch views draw a scroll area in the same panel slot, and an unnamed
             // one shares its persistent state with theirs — the editor's short page clamped the grid back to the top.
-            egui::ScrollArea::vertical().id_salt("grid").show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    let hits = self.hits.clone();
-                    for i in hits {
+            egui::ScrollArea::vertical().id_salt("grid").show_viewport(ui, |ui, viewport| {
+                ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+                // Only the rows in view are laid out, as egui's own show_rows does it: the cells are all one size,
+                // so row k sits at k × STEP and the whole list is one height. Walking every hit through
+                // horizontal_wrapped cost 15–20 ms a frame at 28k hits, on screen or not (measured 2026-11-06).
+                let hits = std::mem::take(&mut self.hits);
+                let cols = columns(ui.available_width());
+                let rows = hits.len().div_ceil(cols);
+                ui.set_height((rows as f32 * STEP - GAP).max(0.0));
+                let (first, last) = rows_in(viewport, rows);
+                let top = ui.max_rect().top();
+                let band = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top + first as f32 * STEP..=top + last as f32 * STEP);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(band), |ui| for k in first..last {
+                    ui.push_id(k, |ui| ui.horizontal(|ui| for &i in &hits[k * cols..((k + 1) * cols).min(hits.len())] {
                         // fixed cell first; only tiles actually on screen are requested; decoding happens on the worker pool
                         let (cell, resp) = ui.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::click());
                         if !ui.is_rect_visible(cell) { continue; }
@@ -1756,7 +1743,7 @@ impl App {
                             else { ui.label(row.tags.iter().map(String::as_str).collect::<Vec<_>>().join(" · ")); }
                             match (self.assist, tier(row, self.thin_below)) {
                                 (true, Tier::Untagged) => { ui.colored_label(widgets::UNTAGGED, "No tags written by hand yet"); }
-                                (true, Tier::Thin) => { ui.colored_label(widgets::THIN, format!("Only {} written by hand", plural(row.xmp_tag_count, "tag"))); }
+                                (true, Tier::Thin) => { ui.colored_label(widgets::THIN, format!("Only {} written by hand", widgets::count(row.xmp_tag_count as usize, "tag"))); }
                                 _ => {}
                             }
                             ui.label(egui::RichText::new("OCR text").strong());
@@ -1778,8 +1765,9 @@ impl App {
                         });
                         if r.clicked() && !edit_hit && !selection_hit { clicked = Some((i, true)); }
                         else if r.clicked_by(egui::PointerButton::Middle) && !selection_hit { clicked = Some((i, false)); }
-                    }
+                    }));
                 });
+                self.hits = hits;
                 if let Some(key) = navigation {
                     // Use real content bounds for Home/End: overshooting an estimated
                     // height would hit the boundary before the easing completes.
@@ -1801,14 +1789,14 @@ impl App {
         } else if let Some(i) = preview {
             self.open_external(i, ctx);
         } else if let Some((i, close)) = clicked {
-            self.copy(i, close, ctx);
+            self.copy(i, close);
         }
         if any_video {
             ctx.request_repaint_after(Duration::from_secs_f64(next_wake.clamp(0.004, 1.0)));
         }
         // wake at the earliest tile's next frame boundary
         else if self
-            .toast
+            .notice
             .as_ref()
             .map(|(_, t)| t.elapsed() < Duration::from_secs(3))
             .unwrap_or(false)
@@ -1853,13 +1841,6 @@ fn tier(r: &FileRow, thin_below: i64) -> Tier {
         0 => Tier::Untagged,
         n if n < thin_below => Tier::Thin,
         _ => Tier::Tagged,
-    }
-}
-fn plural(n: i64, word: &str) -> String {
-    if n == 1 {
-        format!("{n} {word}")
-    } else {
-        format!("{n} {word}s")
     }
 }
 /// Tagging assistant marks: an untagged tile gets an orange outline, a thinly tagged one a yellow one; a tagged
@@ -2138,6 +2119,61 @@ mod vocab_refresh_tests {
         );
         assert_eq!(window_prefs(&dir.join("none.toml")), WindowPrefs::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn grid_columns_follow_the_width_the_way_egui_wraps() {
+        // Expected by hand: five 200 px tiles with four 8 px gaps are 1032 px, so 1032 → 5 and 1031 → 4;
+        // 1240 → 6; a window narrower than a tile still shows one column.
+        assert_eq!(columns(1032.0), 5);
+        assert_eq!(columns(1031.0), 4);
+        assert_eq!(columns(1240.0), 6);
+        assert_eq!(columns(100.0), 1);
+        // and egui's wrapped layout, which the grid used before, agrees at every width
+        for w in (200..1500).step_by(7).chain([1031, 1032, 1239, 1240]) {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w as f32, 3000.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+                        let width = ui.available_width();
+                        let tops: Vec<f32> = (0..12)
+                            .map(|_| {
+                                ui.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::hover())
+                                    .0
+                                    .top()
+                            })
+                            .collect();
+                        let first_row = tops.iter().filter(|t| **t == tops[0]).count();
+                        assert_eq!(
+                            columns(width),
+                            first_row,
+                            "window {w} px, {width} available"
+                        );
+                    });
+                });
+            })
+            .textures_delta
+            .clear();
+        }
+    }
+    #[test]
+    fn rows_in_view_by_hand() {
+        // Expected by hand with 208 px rows: the top 300 px reach rows 0 and 1 (row 1 starts at 208) plus
+        // egui's row of slack, 0..3; 416..716 starts at row 2, 2..5; near the end the band slides back to the
+        // rows there are, keeping its length; no rows, no band.
+        let view =
+            |a: f32, b: f32| egui::Rect::from_min_max(egui::pos2(0.0, a), egui::pos2(1000.0, b));
+        assert_eq!(rows_in(view(0.0, 300.0), 100), (0, 3));
+        assert_eq!(rows_in(view(416.0, 716.0), 100), (2, 5));
+        assert_eq!(rows_in(view(416.0, 716.0), 4), (1, 4));
+        assert_eq!(rows_in(view(0.0, 300.0), 0), (0, 0));
     }
     #[test]
     fn thin_tier_follows_the_threshold() {

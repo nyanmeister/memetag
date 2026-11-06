@@ -166,13 +166,8 @@ pub fn refresh(c: &Cfg) -> Result<(), String> {
     }
     let mut tags: Vec<_> = tags.into_values().collect();
     tags.sort_by(|a, b| a.name.cmp(&b.name));
-    let path = cache_path(c);
-    std::fs::create_dir_all(path.parent().ok_or("Missing cache directory")?)
-        .map_err(|e| e.to_string())?;
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec(&tags).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec(&tags).map_err(|e| e.to_string())?;
+    crate::paths::atomic_write(&cache_path(c), &json)?;
     println!("Cached {} supplemental tag suggestions", tags.len());
     Ok(())
 }

@@ -13,12 +13,7 @@ use crate::{containers, index::Scan, tagger, vocab::Vocab, xmp, Cfg};
 #[cfg(feature = "gui")]
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet,
-    io::{BufRead, Write},
-    path::{Component, PathBuf},
-    process::Stdio,
-};
+use std::{collections::BTreeSet, io::Write, path::PathBuf, process::Stdio};
 #[cfg(any(feature = "gui", test))]
 use std::{
     collections::{BTreeMap, HashSet},
@@ -65,21 +60,20 @@ enum WorkerRequest {
     Single(SingleWrite),
     Batch(Request),
 }
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WorkerReply {
+    Single(SingleReply),
+    Batch(Reply),
+}
 
+/// A request's file as the worker may touch it: a plain relative name under an absolute root, resolved and
+/// proven to stay inside it.
 fn checked_path(root: &std::path::Path, rel: &str) -> Result<PathBuf, String> {
-    if !root.is_absolute()
-        || rel.is_empty()
-        || !std::path::Path::new(rel)
-            .components()
-            .all(|p| matches!(p, Component::Normal(_)))
-    {
+    if !root.is_absolute() || crate::sources::relative(std::path::Path::new(rel)).is_err() {
         return Err("Invalid batch file path".into());
     }
-    let path = root.join(rel).canonicalize().map_err(|e| e.to_string())?;
-    if !path.starts_with(root.canonicalize().map_err(|e| e.to_string())?) {
-        return Err("File resolves outside the collection".into());
-    }
-    Ok(path)
+    crate::paths::within(root, std::path::Path::new(rel))
 }
 
 fn single_write(request: &SingleWrite) -> Result<SingleReply, String> {
@@ -106,25 +100,11 @@ fn single_write(request: &SingleWrite) -> Result<SingleReply, String> {
 }
 
 fn apply(request: &Request) -> Result<Reply, String> {
-    if !request.root.is_absolute()
-        || request.path.is_empty()
-        || !std::path::Path::new(&request.path)
-            .components()
-            .all(|p| matches!(p, Component::Normal(_)))
-    {
-        return Err("Invalid batch file path".into());
-    }
+    checked_path(&request.root, &request.path)?;
     if !request.add.is_disjoint(&request.remove) {
         return Err("A tag cannot be added and removed together".into());
     }
     let path = request.root.join(&request.path);
-    if !path
-        .canonicalize()
-        .map_err(|e| e.to_string())?
-        .starts_with(request.root.canonicalize().map_err(|e| e.to_string())?)
-    {
-        return Err("File resolves outside the collection".into());
-    }
     let mut bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let packet = containers::get_xmp(&bytes)?;
     let tags: BTreeSet<_> = packet
@@ -172,22 +152,10 @@ fn apply(request: &Request) -> Result<Reply, String> {
 }
 
 pub fn worker() -> Result<(), String> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| e.to_string())?;
-        match serde_json::from_str::<WorkerRequest>(&line) {
-            Ok(WorkerRequest::Single(r)) => serde_json::to_writer(&mut stdout, &single_write(&r)),
-            Ok(WorkerRequest::Batch(r)) => serde_json::to_writer(&mut stdout, &apply(&r)),
-            Err(e) => {
-                serde_json::to_writer(&mut stdout, &Result::<Reply, String>::Err(e.to_string()))
-            }
-        }
-        .map_err(|e| e.to_string())?;
-        writeln!(stdout).map_err(|e| e.to_string())?;
-        stdout.flush().map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    crate::remote::serve_lines(|request| match request {
+        WorkerRequest::Single(r) => single_write(&r).map(WorkerReply::Single),
+        WorkerRequest::Batch(r) => apply(&r).map(WorkerReply::Batch),
+    })
 }
 
 pub(crate) fn requires_remote(path: &std::path::Path) -> Result<bool, String> {
@@ -278,10 +246,7 @@ fn read_server_file(
     let rel = path
         .strip_prefix(&remote.local_root)
         .map_err(|_| "File is outside the configured remote collection")?;
-    if rel.as_os_str().is_empty()
-        || !rel.components().all(|p| matches!(p, Component::Normal(_)))
-        || !remote.root.is_absolute()
-    {
+    if crate::sources::relative(rel).is_err() || !remote.root.is_absolute() {
         return Err("Invalid remote editor file path".into());
     }
     let server_path = remote.root.join(rel);
@@ -465,19 +430,21 @@ fn run_source(
             let result = (|| -> Result<bool, String> {
                 c.for_file(&c.file_path(&path)?)?;
                 let mut reply = if let (Some(input), Some(output)) = (&mut input, &mut output) {
-                    let exchange = (|| -> Result<Result<Reply, String>, String> {
-                        serde_json::to_writer(&mut *input, &request).map_err(|e| e.to_string())?;
-                        writeln!(input).map_err(|e| e.to_string())?;
-                        input.flush().map_err(|e| e.to_string())?;
-                        let mut line = String::new();
-                        if output.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-                            return Err("Batch server disconnected; check connection and helper installation".into());
-                        }
-                        serde_json::from_str(&line)
-                            .map_err(|e| format!("Batch server response: {e}"))
-                    })();
-                    match exchange {
-                        Ok(value) => value?,
+                    let answer: Result<Reply, String> = match crate::remote::exchange(
+                        input,
+                        output,
+                        &request,
+                        "Batch server",
+                    ) {
+                        Ok(Some(answer)) => answer,
+                        Ok(None) => Err(
+                            "Batch server disconnected; check connection and helper installation"
+                                .into(),
+                        ),
+                        Err(e) => Err(e),
+                    };
+                    match answer {
+                        Ok(reply) => reply,
                         Err(e) => {
                             transport_failed = true;
                             return Err(format!(
@@ -561,7 +528,7 @@ pub enum Action {
 pub struct BatchUi {
     paths: Vec<String>,
     loaded: Option<Loaded>,
-    load_rx: mpsc::Receiver<Result<Loaded, String>>,
+    load: widgets::Pending<Loaded>,
     add: BTreeSet<String>,
     remove: BTreeSet<String>,
     add_input: TagInput,
@@ -579,53 +546,48 @@ pub struct BatchUi {
 #[cfg(feature = "gui")]
 impl BatchUi {
     pub fn new(c: Cfg, paths: Vec<String>, ctx: egui::Context) -> Self {
-        let (tx, rx) = mpsc::channel();
         let selected: HashSet<_> = paths.iter().cloned().collect();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<Loaded, String> {
-                let db = Db::open_cfg(&c)?;
-                let mut counts = BTreeMap::new();
-                let mut all: BTreeMap<String, usize> = BTreeMap::new();
-                let mut st = db
-                    .conn
-                    .prepare("SELECT path,tag,source FROM tags")
-                    .map_err(|e| e.to_string())?;
-                for row in st
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                        ))
-                    })
-                    .map_err(|e| e.to_string())?
-                {
-                    let (path, tag, source) = row.map_err(|e| e.to_string())?;
-                    if selected.contains(&path) {
-                        if source == "xmp" {
-                            *counts.entry(tag.clone()).or_insert(0) += 1;
-                        }
-                        *all.entry(tag).or_insert(0) += 1;
-                    }
-                }
-                let shared_all = all
-                    .into_iter()
-                    .filter(|(_, n)| *n == selected.len())
-                    .map(|(t, _)| t)
-                    .collect();
-                Ok(Loaded {
-                    counts,
-                    shared_all,
-                    suggestions: autocomplete::load(&c),
+        let load = widgets::Pending::spawn(&ctx, move || {
+            let db = Db::open_cfg(&c)?;
+            let mut counts = BTreeMap::new();
+            let mut all: BTreeMap<String, usize> = BTreeMap::new();
+            let mut st = db
+                .conn
+                .prepare("SELECT path,tag,source FROM tags")
+                .map_err(|e| e.to_string())?;
+            for row in st
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })
-            })();
-            let _ = tx.send(result);
-            ctx.request_repaint();
+                .map_err(|e| e.to_string())?
+            {
+                let (path, tag, source) = row.map_err(|e| e.to_string())?;
+                if selected.contains(&path) {
+                    if source == "xmp" {
+                        *counts.entry(tag.clone()).or_insert(0) += 1;
+                    }
+                    *all.entry(tag).or_insert(0) += 1;
+                }
+            }
+            let shared_all = all
+                .into_iter()
+                .filter(|(_, n)| *n == selected.len())
+                .map(|(t, _)| t)
+                .collect();
+            Ok(Loaded {
+                counts,
+                shared_all,
+                suggestions: autocomplete::load(&c),
+            })
         });
         Self {
             paths,
             loaded: None,
-            load_rx: rx,
+            load,
             add: BTreeSet::new(),
             remove: BTreeSet::new(),
             add_input: {
@@ -657,13 +619,10 @@ impl BatchUi {
     pub fn show(&mut self, ui: &mut egui::Ui, c: &Cfg) -> Action {
         let ctx = ui.ctx().clone();
         if self.loaded.is_none() && self.errors.is_empty() {
-            match self.load_rx.try_recv() {
-                Ok(Ok(loaded)) => self.loaded = Some(loaded),
-                Ok(Err(e)) => self.errors.push(e),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.errors.push("Batch loading stopped".into())
-                }
-                _ => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+            match self.load.poll(&ctx, "Batch loading stopped") {
+                Some(Ok(loaded)) => self.loaded = Some(loaded),
+                Some(Err(e)) => self.errors.push(e),
+                None => {}
             }
         }
         if let Some(rx) = &self.rx {

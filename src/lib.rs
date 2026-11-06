@@ -146,6 +146,17 @@ pub struct Cfg {
     pub embed_model: Option<PathBuf>,
 }
 
+impl Cfg {
+    /// vocab.toml as it is on disk now, so a hand edit or a pull since start-up is kept, never written over; the
+    /// copy in memory when there is no file.
+    pub fn vocab_on_disk(&self) -> vocab::Vocab {
+        match &self.vocab.path {
+            Some(p) => vocab::Vocab::load(p),
+            None => self.vocab.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 impl Cfg {
     /// A collection at `root` with its index and thumbnails beside it: no sources registry, no models, an ollama

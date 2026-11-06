@@ -1,9 +1,8 @@
 //! Stable source identities, independent of labels and mount points.
-use crate::{index, library::Scope, locking, Cfg};
+use crate::{index, library::Scope, Cfg};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::Write,
     path::{Component, Path, PathBuf},
 };
 
@@ -81,13 +80,6 @@ pub struct Library {
 pub fn path() -> PathBuf {
     crate::paths::config_dir().join("sources.toml")
 }
-fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
-}
 pub fn relative(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty()
         || !path.components().all(|c| matches!(c, Component::Normal(_)))
@@ -103,7 +95,9 @@ impl Library {
     }
     fn bootstrap(root: &Path) -> Result<Self, String> {
         let mut remote = None;
-        if let Some(bytes) = read(&crate::paths::config_dir().join("config.toml"))? {
+        if let Some(bytes) =
+            crate::paths::read_opt(&crate::paths::config_dir().join("config.toml"))?
+        {
             let config: toml::Table =
                 toml::from_str(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)
                     .map_err(|e| format!("configuration: {e}"))?;
@@ -247,22 +241,14 @@ impl Library {
                 continue;
             }
             for p in &s.scope.include {
-                scope.include.push(
-                    PathBuf::from(&s.id).join(
-                        p.components()
-                            .filter(|c| *c != Component::CurDir)
-                            .collect::<PathBuf>(),
-                    ),
-                );
+                scope
+                    .include
+                    .push(PathBuf::from(&s.id).join(crate::paths::clean(p)));
             }
             for p in &s.scope.exclude {
-                scope.exclude.push(
-                    PathBuf::from(&s.id).join(
-                        p.components()
-                            .filter(|c| *c != Component::CurDir)
-                            .collect::<PathBuf>(),
-                    ),
-                );
+                scope
+                    .exclude
+                    .push(PathBuf::from(&s.id).join(crate::paths::clean(p)));
             }
         }
         scope
@@ -295,7 +281,7 @@ impl Draft {
         Ok(())
     }
     pub fn load(root: &Path) -> Result<Self, String> {
-        let original = read(&path())?;
+        let original = crate::paths::read_opt(&path())?;
         let library = match &original {
             Some(bytes) => toml::from_str(std::str::from_utf8(bytes).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("sources configuration: {e}"))?,
@@ -331,11 +317,7 @@ impl Draft {
     ) -> Result<String, String> {
         // Do not stat or canonicalize a network mount: registering an offline server is allowed.
         remote.validate()?;
-        let path: PathBuf = path
-            .components()
-            .filter(|c| *c != Component::CurDir)
-            .collect();
-        self.register(name, path, Some(remote))
+        self.register(name, crate::paths::clean(path), Some(remote))
     }
     fn register(
         &mut self,
@@ -377,10 +359,7 @@ impl Draft {
                 .iter_mut()
                 .find(|s| s.id == id)
                 .ok_or("Unknown source")?
-                .path = path
-                .components()
-                .filter(|c| *c != Component::CurDir)
-                .collect();
+                .path = crate::paths::clean(path);
             library.validate()?;
             self.library = library;
             return Ok(());
@@ -414,13 +393,6 @@ impl Draft {
     }
     pub fn save(&mut self) -> Result<(), String> {
         self.library.validate()?;
-        let path = path();
-        let parent = path.parent().ok_or("No configuration directory")?;
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let _lock = locking::sidecar(&path.with_extension("lock"))?;
-        if read(&path)? != self.original {
-            return Err("Sources changed in another window; reopen before saving".into());
-        }
         // Compare bootstrap selection too: another old window may have changed library.toml.
         if self
             .bootstrap
@@ -432,25 +404,14 @@ impl Draft {
         let bytes = toml::to_string_pretty(&self.library)
             .map_err(|e| e.to_string())?
             .into_bytes();
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        let result = (|| {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| e.to_string())?;
-            file.write_all(&bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|e| e.to_string())?;
-            fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-            fs::File::open(parent)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| e.to_string())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(tmp);
-        }
-        result?;
+        let path = path();
+        crate::paths::save_guarded(
+            &path,
+            &path.with_extension("lock"),
+            &self.original,
+            &bytes,
+            "Sources changed in another window; reopen before saving",
+        )?;
         self.original = Some(bytes);
         Ok(())
     }

@@ -75,6 +75,8 @@ pub struct TagsUi {
     add_name: String,
     focus_filter: u8,
     suggestions: Vec<(String, u64, bool)>,
+    /// The counts and suggestions being read from the index, on the card's open and after a batch.
+    load: widgets::Pending<(Vec<(String, usize)>, Vec<(String, u64, bool)>)>,
     renaming: Option<String>,
     to: TagInput,
     deleting: Option<String>,
@@ -95,7 +97,7 @@ pub struct TagsUi {
 }
 
 impl TagsUi {
-    pub fn new(c: &Cfg) -> Self {
+    pub fn new(c: &Cfg, ctx: &egui::Context) -> Self {
         let mut this = Self {
             counts: vec![],
             filter: String::new(),
@@ -105,6 +107,7 @@ impl TagsUi {
             add_name: String::new(),
             focus_filter: 4,
             suggestions: vec![],
+            load: Default::default(),
             renaming: None,
             to: TagInput::default(),
             deleting: None,
@@ -119,19 +122,20 @@ impl TagsUi {
             category_to: String::new(),
             removing_category: None,
         };
-        this.reload(c);
+        this.reload(c, ctx);
         this
     }
-    /// Re-read the counts from the index, after a batch changed files.
-    pub fn reload(&mut self, c: &Cfg) {
-        match load(c) {
-            Ok((counts, suggestions)) => {
-                self.counts = counts;
-                self.suggestions = suggestions;
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e),
-        }
+    /// Re-read the counts from the index on a thread (the card opens; a batch changed files); `show` takes the
+    /// answer when it lands.
+    pub fn reload(&mut self, c: &Cfg, ctx: &egui::Context) {
+        let c = c.clone();
+        self.load = widgets::Pending::spawn(ctx, move || load(&c));
+    }
+    /// A reload's answer: the counts and suggestions; a Rename or Delete form on a tag that went closes.
+    fn loaded(&mut self, counts: Vec<(String, usize)>, suggestions: Vec<(String, u64, bool)>) {
+        self.counts = counts;
+        self.suggestions = suggestions;
+        self.error = None;
         let known = |t: &Option<String>| {
             t.as_ref()
                 .is_some_and(|t| self.counts.iter().any(|(k, _)| k == t))
@@ -159,20 +163,6 @@ impl TagsUi {
     }
     pub fn request_close(&mut self) {
         self.closing = true;
-    }
-    fn files(n: usize) -> String {
-        if n == 1 {
-            "1 file".into()
-        } else {
-            format!("{n} files")
-        }
-    }
-    fn tags(n: usize) -> String {
-        if n == 1 {
-            "1 tag".into()
-        } else {
-            format!("{n} tags")
-        }
     }
     /// A tag whose category comes from another tag: a denial (not:x) and a relation (chibi<x>) take x's.
     fn derived(t: &str) -> bool {
@@ -216,13 +206,13 @@ impl TagsUi {
         self.shown_for = Some(self.filter.clone());
     }
     /// The plan for one tag: every file carrying it by hand loses it and, for a rename, gains the new name.
-    fn plan(&mut self, c: &Cfg, tag: &str, to: Option<String>) -> Action {
+    fn plan(&mut self, c: &Cfg, ctx: &egui::Context, tag: &str, to: Option<String>) -> Action {
         match paths_with(c, tag) {
             Ok(paths) if paths.is_empty() => {
                 self.error = Some(format!(
                     "No file carries \"{tag}\" any more; the list was stale"
                 ));
-                self.reload(c);
+                self.reload(c, ctx);
                 Action::None
             }
             Ok(paths) => {
@@ -335,7 +325,7 @@ impl TagsUi {
                 }
                 let chip = widgets::tinted_button(ui, &name, widgets::category_fill(&self.vocab, &name));
                 ui.add(chip.sense(egui::Sense::hover()));
-                ui.label(egui::RichText::new(Self::tags(n)).weak());
+                ui.label(egui::RichText::new(widgets::count(n, "tag")).weak());
                 if other {
                     ui.label(egui::RichText::new("tags with no category").weak());
                     return;
@@ -405,7 +395,7 @@ impl TagsUi {
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "Take the category off {}? The tags stay on their files.",
-                            Self::tags(n)
+                            widgets::count(n, "tag")
                         ));
                         if ui.button("Remove").clicked() {
                             *action = Action::RemoveCategory(name.clone());
@@ -452,7 +442,7 @@ impl TagsUi {
     ) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(tag).strong());
-            ui.label(Self::files(n));
+            ui.label(widgets::count(n, "file"));
             let now = self.vocab.category_of(tag);
             let label = now.as_deref().unwrap_or(vocab::OTHER);
             if Self::derived(tag) {
@@ -506,11 +496,11 @@ impl TagsUi {
                 ui.small(match existing {
                     Some((k, m)) => format!(
                         "\"{k}\" already exists on {}; this merges \"{tag}\" into it.",
-                        Self::files(*m)
+                        widgets::count(*m, "file")
                     ),
                     None => format!(
                         "Enter, Tab, Ctrl+S or a suggestion opens the plan: {} lose \"{tag}\" and get the new name.",
-                        Self::files(n)
+                        widgets::count(n, "file")
                     ),
                 });
             });
@@ -518,7 +508,10 @@ impl TagsUi {
         if self.deleting.as_deref() == Some(tag) {
             ui.indent(("delete", tag), |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("Take \"{tag}\" out of {}?", Self::files(n)));
+                    ui.label(format!(
+                        "Take \"{tag}\" out of {}?",
+                        widgets::count(n, "file")
+                    ));
                     if ui.button("Open the plan").clicked() {
                         *delete = Some(tag.to_string());
                     }
@@ -531,7 +524,11 @@ impl TagsUi {
     }
 
     pub fn show(&mut self, ctx: &egui::Context, c: &Cfg) -> Action {
-        let max = ctx.content_rect().size() - egui::vec2(40.0, 60.0);
+        match self.load.poll(ctx, "Loading stopped") {
+            Some(Ok((counts, suggestions))) => self.loaded(counts, suggestions),
+            Some(Err(e)) => self.error = Some(e),
+            None => {}
+        }
         let mut open = true;
         let mut action = Action::None;
         let mut rename: Option<(String, String)> = None;
@@ -539,102 +536,100 @@ impl TagsUi {
         let mut categories: Vec<(String, Option<String>)> = vec![];
         self.refilter();
         let order = self.order.clone();
-        egui::Window::new("Tags")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_size(egui::vec2(760.0, 820.0).min(max))
-            .max_size(max)
-            .show(ctx, |ui| {
-                egui::CollapsingHeader::new("How this works")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.label(HELP);
-                    });
-                ui.separator();
-                egui::CollapsingHeader::new("Categories")
-                    .default_open(true)
-                    .show(ui, |ui| self.categories_section(ui, &mut action));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Find");
-                    if self.focus_filter > 0 && !widgets::clicking(ui) {
-                        self.focus_filter -= 1;
-                        let id = ui.make_persistent_id("tags-filter");
-                        if ui.memory(|m| m.had_focus_last_frame(id) && m.has_focus(id)) {
-                            self.focus_filter = 0;
-                        } else {
-                            ui.memory_mut(|m| m.request_focus(id));
-                        }
-                    }
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            // an explicit id: the field's own `id_salt` registers under another id than
-                            // make_persistent_id gives, and the focus request then dies on egui's dead-man's
-                            // switch (traced 2026-10-07)
-                            .id(ui.make_persistent_id("tags-filter"))
-                            .desired_width(240.0)
-                            .hint_text("part of a tag"),
-                    );
-                    ui.label(format!("{} tags written by hand", self.counts.len()));
+        widgets::card(ctx, "Tags", [760.0, 820.0], false, &mut open, |ui| {
+            egui::CollapsingHeader::new("How this works")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label(HELP);
                 });
-                if let Some(e) = &self.error {
-                    ui.colored_label(widgets::ERROR, e);
-                }
-                ui.separator();
-                self.refilter(); // the Find may have changed this frame
-                let needle = self.filter.trim().to_lowercase();
-                // the bulk action leaves derived names out, so a category is never written against one
-                if !needle.is_empty() && !self.shown.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} shown.", self.shown.len()));
-                        if let Some(pick) = self.category_menu(
-                            ui,
-                            "tags-bulk-category",
-                            None,
-                            "Set all shown to…",
-                            &order,
-                        ) {
-                            categories = self
-                                .shown
-                                .iter()
-                                .map(|&i| self.counts[i].0.clone())
-                                .filter(|t| !Self::derived(t))
-                                .map(|t| (t, pick.clone()))
-                                .collect();
-                        }
-                    });
-                }
-                if self.shown.is_empty() {
-                    ui.label(if self.counts.is_empty() {
-                        "No tags written by hand yet."
+            ui.separator();
+            egui::CollapsingHeader::new("Categories")
+                .default_open(true)
+                .show(ui, |ui| self.categories_section(ui, &mut action));
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Find");
+                if self.focus_filter > 0 && !widgets::clicking(ui) {
+                    self.focus_filter -= 1;
+                    let id = ui.make_persistent_id("tags-filter");
+                    if ui.memory(|m| m.had_focus_last_frame(id) && m.has_focus(id)) {
+                        self.focus_filter = 0;
                     } else {
-                        "Nothing matches."
-                    });
+                        ui.memory_mut(|m| m.request_focus(id));
+                    }
                 }
-                let shown = std::mem::take(&mut self.shown);
-                let mut heights = std::mem::take(&mut self.heights);
-                egui::ScrollArea::vertical()
-                    .id_salt("tags-list")
-                    .auto_shrink([false, false])
-                    .show_viewport(ui, |ui, viewport| {
-                        widgets::rows_in_view(ui, viewport, &mut heights, ROW_GUESS, |ui, i| {
-                            let (tag, n) = self.counts[shown[i]].clone();
-                            self.tag_row(
-                                ui,
-                                c,
-                                &tag,
-                                n,
-                                &order,
-                                &mut rename,
-                                &mut delete,
-                                &mut categories,
-                            );
-                        });
-                    });
-                self.shown = shown;
-                self.heights = heights;
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        // an explicit id: the field's own `id_salt` registers under another id than
+                        // make_persistent_id gives, and the focus request then dies on egui's dead-man's
+                        // switch (traced 2026-10-07)
+                        .id(ui.make_persistent_id("tags-filter"))
+                        .desired_width(240.0)
+                        .hint_text("part of a tag"),
+                );
+                if self.load.busy() {
+                    ui.spinner();
+                } else {
+                    ui.label(format!("{} tags written by hand", self.counts.len()));
+                }
             });
+            if let Some(e) = &self.error {
+                ui.colored_label(widgets::ERROR, e);
+            }
+            ui.separator();
+            self.refilter(); // the Find may have changed this frame
+            let needle = self.filter.trim().to_lowercase();
+            // the bulk action leaves derived names out, so a category is never written against one
+            if !needle.is_empty() && !self.shown.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} shown.", self.shown.len()));
+                    if let Some(pick) = self.category_menu(
+                        ui,
+                        "tags-bulk-category",
+                        None,
+                        "Set all shown to…",
+                        &order,
+                    ) {
+                        categories = self
+                            .shown
+                            .iter()
+                            .map(|&i| self.counts[i].0.clone())
+                            .filter(|t| !Self::derived(t))
+                            .map(|t| (t, pick.clone()))
+                            .collect();
+                    }
+                });
+            }
+            if self.shown.is_empty() && !self.load.busy() {
+                ui.label(if self.counts.is_empty() {
+                    "No tags written by hand yet."
+                } else {
+                    "Nothing matches."
+                });
+            }
+            let shown = std::mem::take(&mut self.shown);
+            let mut heights = std::mem::take(&mut self.heights);
+            egui::ScrollArea::vertical()
+                .id_salt("tags-list")
+                .auto_shrink([false, false])
+                .show_viewport(ui, |ui, viewport| {
+                    widgets::rows_in_view(ui, viewport, &mut heights, ROW_GUESS, |ui, i| {
+                        let (tag, n) = self.counts[shown[i]].clone();
+                        self.tag_row(
+                            ui,
+                            c,
+                            &tag,
+                            n,
+                            &order,
+                            &mut rename,
+                            &mut delete,
+                            &mut categories,
+                        );
+                    });
+                });
+            self.shown = shown;
+            self.heights = heights;
+        });
         // Ctrl+S commits whichever of the two is open (wishlist, 2026-09-22), the same as Enter in the field or the button
         if rename.is_none() && delete.is_none() && crate::widgets::chord(ctx, egui::Key::S) {
             if let Some(tag) = self.renaming.clone() {
@@ -647,9 +642,9 @@ impl TagsUi {
             }
         }
         if let Some((from, to)) = rename {
-            action = self.plan(c, &from, Some(to));
+            action = self.plan(c, ctx, &from, Some(to));
         } else if let Some(tag) = delete {
-            action = self.plan(c, &tag, None);
+            action = self.plan(c, ctx, &tag, None);
         }
         // a picked colour goes out once it has settled and the button is up; the card keeps the tint live meanwhile
         if let Some((name, rgb, at)) = self.pending_color.clone() {

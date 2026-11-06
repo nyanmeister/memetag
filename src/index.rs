@@ -30,6 +30,76 @@ pub struct FileRow {
     pub text: String,
 }
 
+/// Every table keyed by a file's path: what `Db::forget` clears when a file leaves the index.
+const PER_PATH: [&str; 7] = [
+    "files",
+    "tags",
+    "text",
+    "phash2",
+    "text_meta",
+    "manual_text",
+    "proposal_rejects",
+];
+/// The caches of a file's reading and pixels: carried across a rename by `pull`, and all but the reviewed
+/// text dropped when a scan shows different pixels under the same path.
+pub(crate) const CARRIED: [&str; 4] = ["text", "text_meta", "manual_text", "phash2"];
+/// The columns `FileRow::from_row` reads, in its order.
+const COLUMNS: &str =
+    "id,path,format,kind,width,height,size,mtime,created_at,tagged_at,xmp_tag_count";
+impl FileRow {
+    fn from_row(r: &rusqlite::Row) -> rusqlite::Result<FileRow> {
+        Ok(FileRow {
+            id: r.get(0)?,
+            path: r.get(1)?,
+            format: r.get(2)?,
+            kind: r.get(3)?,
+            width: r.get(4)?,
+            height: r.get(5)?,
+            size: r.get(6)?,
+            mtime: r.get(7)?,
+            created_at: r.get(8)?,
+            tagged_at: r.get(9)?,
+            xmp_tag_count: r.get(10)?,
+            tags: BTreeSet::new(),
+            text: String::new(),
+        })
+    }
+}
+/// `MEMETAG_TRACE=1` prints where the time goes on stderr (the index open and the row load), for measuring
+/// a change rather than guessing at it.
+pub(crate) fn trace(what: &str, since: std::time::Instant) {
+    if std::env::var_os("MEMETAG_TRACE").is_some() {
+        eprintln!(
+            "trace: {what} {:.0} ms",
+            since.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
+/// Each row's position by path, for folding a change keyed by path into a loaded row set.
+pub fn by_path(rows: &[FileRow]) -> HashMap<&str, usize> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| (r.path.as_str(), i))
+        .collect()
+}
+/// Write the rules, then rebuild what they derive. The file goes first: if the index update then fails, the next
+/// reindex or rule change catches up, and nothing is lost. Returns the rows whose tags changed.
+pub fn save_rules(c: &Cfg, vocab: &mut Vocab) -> Result<Vec<(String, BTreeSet<String>)>, String> {
+    vocab.save()?;
+    Db::open_cfg(c)?
+        .reimply(vocab)
+        .map_err(|e| format!("vocab.toml saved, but the index was not updated: {e}"))
+}
+/// `.s()?` is `.map_err(|e| e.to_string())?`: the crate's errors are strings, SQLite's are not.
+trait Str<T> {
+    fn s(self) -> Result<T, String>;
+}
+impl<T, E: std::fmt::Display> Str<T> for Result<T, E> {
+    fn s(self) -> Result<T, String> {
+        self.map_err(|e| e.to_string())
+    }
+}
+
 fn migrate_sources(conn: &Connection, path: &Path) -> Result<(), String> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -62,15 +132,7 @@ fn migrate_sources(conn: &Connection, path: &Path) -> Result<(), String> {
     }
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let staging = format!("__migration_{nonce}_{}/", std::process::id());
-    for table in [
-        "files",
-        "tags",
-        "text",
-        "phash2",
-        "text_meta",
-        "manual_text",
-        "proposal_rejects",
-    ] {
+    for table in PER_PATH {
         let collision: i64 = tx
             .query_row(
                 &format!("SELECT count(*) FROM {table} WHERE substr(path,1,?1)=?2"),
@@ -100,43 +162,17 @@ pub fn fmt_time(t: f64) -> String {
     chrono_lite(t as i64)
 }
 fn chrono_lite(s: i64) -> String {
-    // UTC, no crate
-    let days = s.div_euclid(86400);
-    let rem = s.rem_euclid(86400);
-    let (mut y, mut m, mut d) = (1970i64, 1i64, 1i64);
-    let mut left = days;
-    loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-        let ylen = if leap { 366 } else { 365 };
-        if left < ylen {
-            break;
-        }
-        left -= ylen;
-        y += 1;
-    }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let ml = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    for (i, &n) in ml.iter().enumerate() {
-        if left < n {
-            m = i as i64 + 1;
-            d = left + 1;
-            break;
-        }
-        left -= n;
-    }
+    let (days, rem) = (s.div_euclid(86400), s.rem_euclid(86400));
+    // civil-from-days (Howard Hinnant), the inverse of the days-from-civil in query::parse_date
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
     format!(
         "{y:04}-{m:02}-{d:02} {:02}:{:02}Z",
         rem / 3600,
@@ -163,6 +199,7 @@ impl Db {
         }
     }
     fn open_scope(path: &Path, scope: crate::library::Scope, multi: bool) -> Result<Db, String> {
+        let t0 = std::time::Instant::now();
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
@@ -214,23 +251,26 @@ impl Db {
         if multi {
             migrate_sources(&conn, path)?;
         }
+        // The paths this scope leaves out, for every reader's `NOT IN`: one prepared insert inside one
+        // transaction (26k rows took 160 ms as separate statements), and nothing to do for a scope that
+        // excludes nothing.
         conn.execute_batch("CREATE TEMP TABLE excluded_files(path TEXT PRIMARY KEY)")
-            .map_err(|e| e.to_string())?;
-        {
-            let mut query = conn
-                .prepare("SELECT path FROM files")
-                .map_err(|e| e.to_string())?;
-            for row in query
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
+            .s()?;
+        if scope != crate::library::Scope::default() {
+            let tx = conn.unchecked_transaction().s()?;
             {
-                let path = row.map_err(|e| e.to_string())?;
-                if !scope.contains(Path::new(&path)) {
-                    conn.execute("INSERT INTO excluded_files VALUES(?1)", [path])
-                        .map_err(|e| e.to_string())?;
+                let mut query = tx.prepare("SELECT path FROM files").s()?;
+                let mut exclude = tx.prepare("INSERT INTO excluded_files VALUES(?1)").s()?;
+                for row in query.query_map([], |r| r.get::<_, String>(0)).s()? {
+                    let path = row.s()?;
+                    if !scope.contains(Path::new(&path)) {
+                        exclude.execute([path]).s()?;
+                    }
                 }
             }
+            tx.commit().s()?;
         }
+        trace("index open", t0);
         Ok(Db { conn, scope })
     }
 
@@ -255,38 +295,78 @@ impl Db {
     }
     /// One row with its tags and text, as `all()` would build it.
     pub fn row(&self, rel: &str) -> Result<Option<FileRow>, String> {
-        use rusqlite::OptionalExtension;
-        let mut row = match self.conn.query_row("SELECT id,path,format,kind,width,height,size,mtime,created_at,tagged_at,xmp_tag_count FROM files WHERE path=?1", [rel],
-            |r| Ok(FileRow { id: r.get(0)?, path: r.get(1)?, format: r.get(2)?, kind: r.get(3)?, width: r.get(4)?, height: r.get(5)?, size: r.get(6)?, mtime: r.get(7)?, created_at: r.get(8)?, tagged_at: r.get(9)?, xmp_tag_count: r.get(10)?, tags: BTreeSet::new(), text: String::new() }))
-            .optional().map_err(|e| e.to_string())? { Some(r) => r, None => return Ok(None) };
-        let mut st = self
+        Ok(self.load(Some(rel), false)?.pop())
+    }
+    /// The rows in scope, newest first.
+    pub fn all(&self) -> Result<Vec<FileRow>, String> {
+        self.load(None, true)
+    }
+    /// Every row, the ones outside the selected folders included.
+    pub fn all_cached(&self) -> Result<Vec<FileRow>, String> {
+        self.load(None, false)
+    }
+    /// The one place a file row is assembled: its columns, its tags, and its text with a review on top (the
+    /// reviewed text wins, even when it is empty). `path` selects one row; `scoped` leaves out the files the
+    /// open scope excluded (`excluded_files`, filled when the index was opened).
+    fn load(&self, path: Option<&str>, scoped: bool) -> Result<Vec<FileRow>, String> {
+        let t0 = std::time::Instant::now();
+        let filter = match (path, scoped) {
+            (Some(_), _) => "path=?1",
+            (None, true) => "path NOT IN (SELECT path FROM excluded_files)",
+            (None, false) => "1",
+        };
+        let args = || rusqlite::params_from_iter(path.iter());
+        let mut rows: Vec<FileRow> = self
             .conn
-            .prepare("SELECT tag FROM tags WHERE path=?1")
-            .map_err(|e| e.to_string())?;
-        row.tags = st
-            .query_map([rel], |r| r.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM files WHERE {filter} ORDER BY created_at DESC, path"
+            ))
+            .s()?
+            .query_map(args(), FileRow::from_row)
+            .s()?
             .filter_map(Result::ok)
             .collect();
-        let manual: Option<String> = self
+        trace("index rows", t0);
+        let at: HashMap<String, usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.path.clone(), i))
+            .collect();
+        let mut tags = self
             .conn
-            .query_row("SELECT body FROM manual_text WHERE path=?1", [rel], |r| {
-                r.get(0)
+            .prepare(&format!("SELECT path, tag FROM tags WHERE {filter}"))
+            .s()?;
+        for r in tags
+            .query_map(args(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
-            .optional()
-            .map_err(|e| e.to_string())?;
-        row.text = match manual {
-            Some(m) => m,
-            None => self
+            .s()?
+            .filter_map(Result::ok)
+        {
+            if let Some(&i) = at.get(&r.0) {
+                rows[i].tags.insert(r.1);
+            }
+        }
+        trace("index tags", t0);
+        for table in ["text", "manual_text"] {
+            let mut st = self
                 .conn
-                .query_row("SELECT body FROM text WHERE path=?1 LIMIT 1", [rel], |r| {
-                    r.get(0)
+                .prepare(&format!("SELECT path, body FROM {table} WHERE {filter}"))
+                .s()?;
+            for r in st
+                .query_map(args(), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                 })
-                .optional()
-                .map_err(|e| e.to_string())?
-                .unwrap_or_default(),
-        };
-        Ok(Some(row))
+                .s()?
+                .filter_map(Result::ok)
+            {
+                if let Some(&i) = at.get(&r.0) {
+                    rows[i].text = r.1;
+                }
+            }
+        }
+        trace("index text", t0);
+        Ok(rows)
     }
 
     /// Import a full scan (a new or changed file from `pull`): rows, tags, embedded text; cached OCR stays unless the file carries its own text.
@@ -358,17 +438,9 @@ impl Db {
             ));
         }
         let mut paths = Vec::<PathBuf>::new();
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
-            e.depth() == 0
-                || !e.file_type().is_dir()
-                || scope.traverse(e.path().strip_prefix(root).unwrap_or(e.path()))
-        }) {
+        for entry in scope.walk(root) {
             let entry = entry.map_err(|e| format!("listing failed; index retained: {e}"))?;
-            if entry.file_type().is_file()
-                && scope.contains(entry.path().strip_prefix(root).unwrap_or(entry.path()))
-            {
-                paths.push(entry.into_path());
-            }
+            paths.push(entry.into_path());
         }
         // Files which failed to parse still exist; do not discard their cached OCR/vector rows.
         let seen_paths: std::collections::HashSet<String> = paths
@@ -474,99 +546,18 @@ impl Db {
             .filter(|p| self.scope.contains(Path::new(p)) && !seen.contains(p))
             .collect();
         for p in gone {
-            for t in [
-                "tags",
-                "files",
-                "text",
-                "phash2",
-                "manual_text",
-                "text_meta",
-            ] {
-                self.conn
-                    .execute(&format!("DELETE FROM {t} WHERE path=?1"), params![p])
-                    .ok();
-            }
+            self.forget(&p)?;
         }
         Ok((ok, bad))
     }
-
-    pub fn all(&self) -> Result<Vec<FileRow>, String> {
-        Ok(self
-            .all_cached()?
-            .into_iter()
-            .filter(|r| self.scope.contains(Path::new(&r.path)))
-            .collect())
-    }
-
-    pub fn all_cached(&self) -> Result<Vec<FileRow>, String> {
-        let mut stmt = self.conn.prepare("SELECT id,path,format,kind,width,height,size,mtime,created_at,tagged_at,xmp_tag_count FROM files ORDER BY created_at DESC, path").map_err(|e| e.to_string())?;
-        let mut rows: Vec<FileRow> = stmt
-            .query_map([], |r| {
-                Ok(FileRow {
-                    id: r.get(0)?,
-                    path: r.get(1)?,
-                    format: r.get(2)?,
-                    kind: r.get(3)?,
-                    width: r.get(4)?,
-                    height: r.get(5)?,
-                    size: r.get(6)?,
-                    mtime: r.get(7)?,
-                    created_at: r.get(8)?,
-                    tagged_at: r.get(9)?,
-                    xmp_tag_count: r.get(10)?,
-                    tags: BTreeSet::new(),
-                    text: String::new(),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .filter_map(Result::ok)
-            .collect();
-        let mut ts = self
-            .conn
-            .prepare("SELECT path, tag FROM tags")
-            .map_err(|e| e.to_string())?;
-        let mut map: std::collections::HashMap<String, BTreeSet<String>> = Default::default();
-        for r in ts
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .map_err(|e| e.to_string())?
-            .filter_map(Result::ok)
-        {
-            map.entry(r.0).or_default().insert(r.1);
+    /// Drop every row of a file that left the index: its row, tags, text, hashes and proposal decisions.
+    pub fn forget(&self, path: &str) -> Result<(), String> {
+        for t in PER_PATH {
+            self.conn
+                .execute(&format!("DELETE FROM {t} WHERE path=?1"), [path])
+                .s()?;
         }
-        for f in &mut rows {
-            if let Some(t) = map.remove(&f.path) {
-                f.tags = t;
-            }
-        }
-        let mut tx = self
-            .conn
-            .prepare("SELECT path, body FROM text")
-            .map_err(|e| e.to_string())?;
-        let mut texts: std::collections::HashMap<String, String> = Default::default();
-        for r in tx
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .map_err(|e| e.to_string())?
-            .filter_map(Result::ok)
-        {
-            texts.insert(r.0, r.1);
-        }
-        let mut manual = self
-            .conn
-            .prepare("SELECT path, body FROM manual_text")
-            .map_err(|e| e.to_string())?;
-        for row in manual
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .map_err(|e| e.to_string())?
-        {
-            let (path, body) = row.map_err(|e| e.to_string())?;
-            texts.insert(path, body);
-        }
-        for f in &mut rows {
-            if let Some(t) = texts.remove(&f.path) {
-                f.text = t;
-            }
-        }
-        Ok(rows)
+        Ok(())
     }
 
     /// Rebuild every derived `implied` row from the stored xmp and folder rows, as a reindex would, without reading a
@@ -623,15 +614,14 @@ impl Db {
     pub fn cached_blobs(&self, alg: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
         let mut st = self
             .conn
-            .prepare("SELECT path, hash FROM phash2 WHERE alg=?1")
-            .map_err(|e| e.to_string())?;
+            .prepare("SELECT path, hash FROM phash2 WHERE alg=?1 AND path NOT IN (SELECT path FROM excluded_files)")
+            .s()?;
         let v = st
             .query_map([alg], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
             })
-            .map_err(|e| e.to_string())?
+            .s()?
             .filter_map(Result::ok)
-            .filter(|(p, _)| self.scope.contains(Path::new(p)))
             .collect();
         Ok(v)
     }
@@ -654,16 +644,18 @@ impl Db {
             .map_err(|e| e.to_string())?;
         Ok(rows)
     }
+    /// Every tag in scope with the number of files carrying it, most used first, then by name.
     pub fn tag_counts(&self) -> Result<Vec<(String, i64)>, String> {
-        let mut counts = HashMap::<String, i64>::new();
-        for row in self.all()? {
-            for tag in row.tags {
-                *counts.entry(tag).or_default() += 1;
-            }
-        }
-        let mut values: Vec<_> = counts.into_iter().collect();
-        values.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(values)
+        let mut st = self
+            .conn
+            .prepare("SELECT tag, count(DISTINCT path) FROM tags WHERE path NOT IN (SELECT path FROM excluded_files) GROUP BY tag ORDER BY 2 DESC, 1")
+            .s()?;
+        let v = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .s()?
+            .collect::<Result<Vec<_>, _>>()
+            .s()?;
+        Ok(v)
     }
 }
 
@@ -850,7 +842,7 @@ fn write_row(tx: &rusqlite::Transaction, s: &Scan) -> Result<(), String> {
     // and a replaced picture kept the old picture's text forever). The kind is the length: a pixel hash is 16 hex
     // characters, the provisional ids a letter plus 16. Not the first character: one pixel hash in sixteen starts
     // with "b" as well, and telling the kinds apart that way cost two files their text on 2026-09-22.
-    for t in ["phash2", "text", "text_meta"] {
+    for t in CARRIED.iter().filter(|t| **t != "manual_text") {
         tx.execute(
             &format!(
                 "DELETE FROM {t} WHERE path=?1 AND EXISTS (SELECT 1 FROM files WHERE path=?1 AND id<>?2 \
@@ -867,30 +859,26 @@ fn write_row(tx: &rusqlite::Transaction, s: &Scan) -> Result<(), String> {
     let text_in_file = s.text.is_some() as i64;
     tx.execute("INSERT INTO files(id,path,format,kind,width,height,size,mtime,created_at,tagged_at,xmp_tag_count,indexed_at,text_in_file) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![r.id, r.path, r.format, r.kind, r.width, r.height, r.size, r.mtime, r.created_at, r.tagged_at, r.xmp_tag_count, now, text_in_file]).map_err(|e| e.to_string())?;
-    for t in &s.xmp_tags {
-        tx.execute(
-            "INSERT OR IGNORE INTO tags VALUES(?1,?2,'xmp')",
-            params![r.path, t],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    for t in &s.folder_tags {
-        tx.execute(
-            "INSERT OR IGNORE INTO tags VALUES(?1,?2,'folder')",
-            params![r.path, t],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    for t in r
-        .tags
+    // the file's own tags by source, then what the vocabulary derived from them (everything else in `tags`)
+    let own: BTreeSet<&str> = s
+        .xmp_tags
         .iter()
-        .filter(|t| !s.xmp_tags.contains(t) && !s.folder_tags.contains(t))
+        .chain(&s.folder_tags)
+        .map(String::as_str)
+        .collect();
+    let implied = r.tags.iter().filter(|t| !own.contains(t.as_str()));
+    for (source, t) in s
+        .xmp_tags
+        .iter()
+        .map(|t| ("xmp", t))
+        .chain(s.folder_tags.iter().map(|t| ("folder", t)))
+        .chain(implied.map(|t| ("implied", t)))
     {
         tx.execute(
-            "INSERT OR IGNORE INTO tags VALUES(?1,?2,'implied')",
-            params![r.path, t],
+            "INSERT OR IGNORE INTO tags VALUES(?1,?2,?3)",
+            params![r.path, t, source],
         )
-        .map_err(|e| e.to_string())?;
+        .s()?;
     }
     if s.manual {
         tx.execute(
@@ -922,6 +910,9 @@ mod tests {
         assert_eq!(fmt_time(0.0), "1970-01-01 00:00Z");
         assert_eq!(fmt_time(1_700_000_000.0), "2023-11-14 22:13Z"); // a known instant
         assert_eq!(fmt_time(1_582_934_400.0), "2020-02-29 00:00Z"); // leap day exists in 2020
+        assert_eq!(fmt_time(951_782_400.0), "2000-02-29 00:00Z"); // the century leap day (2000 is divisible by 400)
+        assert_eq!(fmt_time(951_868_800.0), "2000-03-01 00:00Z"); // and the day after it
+        assert_eq!(fmt_time(946_684_740.0), "1999-12-31 23:59Z"); // the last minute of a year
     }
     #[test]
     fn caches_follow_the_picture_not_the_first_tag() {

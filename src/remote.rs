@@ -90,3 +90,71 @@ pub(crate) fn ssh(
     ]);
     ssh
 }
+
+/// A worker's loop: one JSON request per stdin line, one JSON `Result` per stdout line, flushed, until EOF.
+/// A line that is not a request is answered with the parse error, so the client's protocol never stalls.
+pub(crate) fn serve_lines<Req: serde::de::DeserializeOwned, Rep: serde::Serialize>(
+    handle: impl Fn(Req) -> Result<Rep, String>,
+) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let result = serde_json::from_str::<Req>(&line)
+            .map_err(|e| e.to_string())
+            .and_then(&handle);
+        serde_json::to_writer(&mut stdout, &result).map_err(|e| e.to_string())?;
+        writeln!(stdout).map_err(|e| e.to_string())?;
+        stdout.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// One request over a worker's pipes: the JSON line out, the JSON line back. `Ok(None)` is no answer: the pipe
+/// broke or the worker closed its end (an ssh that was refused or timed out, a helper that exited); the caller
+/// names the cause from the child's exit status. `Err` is an answer that was not JSON.
+pub(crate) fn exchange<Req: serde::Serialize, Rep: serde::de::DeserializeOwned>(
+    input: &mut impl std::io::Write,
+    output: &mut impl std::io::BufRead,
+    req: &Req,
+    what: &str,
+) -> Result<Option<Rep>, String> {
+    let mut line = String::new();
+    let sent = serde_json::to_writer(&mut *input, req)
+        .map_err(|e| e.to_string())
+        .and_then(|_| writeln!(input).map_err(|e| e.to_string()))
+        .and_then(|_| input.flush().map_err(|e| e.to_string()))
+        .and_then(|_| output.read_line(&mut line).map_err(|e| e.to_string()));
+    match sent {
+        Ok(0) | Err(_) => Ok(None),
+        Ok(_) => serde_json::from_str(&line)
+            .map(Some)
+            .map_err(|e| format!("{what} response: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn exchange_sends_one_line_and_reads_one_answer() {
+        let mut sent = Vec::new();
+        let mut answers = Cursor::new(b"{\"Ok\":7}\n{\"Err\":\"no\"}\nnot json\n".to_vec());
+        let one: Option<Result<i64, String>> =
+            exchange(&mut sent, &mut answers, &"first", "Worker").unwrap();
+        assert_eq!(one, Some(Ok(7)));
+        assert_eq!(sent, b"\"first\"\n");
+        let two: Option<Result<i64, String>> =
+            exchange(&mut sent, &mut answers, &"second", "Worker").unwrap();
+        assert_eq!(two, Some(Err("no".into())));
+        let bad = exchange::<_, Result<i64, String>>(&mut sent, &mut answers, &"third", "Worker");
+        assert!(bad.unwrap_err().starts_with("Worker response: "));
+        // nothing left to read: no answer, not an error
+        let gone: Option<Result<i64, String>> =
+            exchange(&mut sent, &mut answers, &"fourth", "Worker").unwrap();
+        assert_eq!(gone, None);
+    }
+}

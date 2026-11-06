@@ -66,7 +66,7 @@ pub struct Renamed {
 impl Vocab {
     pub fn load(path: &Path) -> Vocab {
         let mut v = Vocab::default();
-        match Self::read_bytes(path) {
+        match crate::paths::read_opt(path) {
             Ok(bytes) => {
                 if let Some(b) = &bytes {
                     match std::str::from_utf8(b)
@@ -100,34 +100,27 @@ impl Vocab {
                 path.display()
             ));
         }
-        let _lock = Self::lock(path)?;
-        let current = Self::read_bytes(path)?;
-        if current != self.original {
-            return Err("Rules changed since editing began. Close and reopen the Implications card before saving.".into());
-        }
-        let old = String::from_utf8(current.unwrap_or_default()).map_err(|e| e.to_string())?;
+        let old = String::from_utf8(self.original.clone().unwrap_or_default())
+            .map_err(|e| e.to_string())?;
         let header: String = old
             .lines()
             .take_while(|l| !l.trim_start().starts_with('['))
             .map(|l| format!("{l}\n"))
             .collect();
         let body = self.normalized_body();
-        let tmp = path.with_extension("toml.tmp");
         let bytes = format!("{header}{body}").into_bytes();
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+        crate::paths::save_guarded(
+            path,
+            &path.with_extension("toml.lock"),
+            &self.original,
+            &bytes,
+            "Rules changed since editing began. Close and reopen the Implications card before saving.",
+        )?;
         self.original = Some(bytes);
         Ok(())
     }
     pub fn lock(path: &Path) -> Result<crate::locking::Lock, String> {
         crate::locking::sidecar(&path.with_extension("toml.lock"))
-    }
-    pub fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
-        match std::fs::read(path) {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("read {}: {e}", path.display())),
-        }
     }
     /// The tables as `save` writes them — aliases then implications, both sorted, empty rules dropped, each rule's
     /// targets sorted and deduplicated — without the header comment. The sync fingerprints a hash of exactly this,
@@ -219,39 +212,17 @@ impl Vocab {
     }
     /// Every rule as (specific, general) pairs, sorted, for listing.
     pub fn rules(&self) -> Vec<(String, String)> {
-        let mut v: Vec<(String, String)> = self
-            .implications
-            .iter()
-            .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
-            .collect();
-        v.sort();
-        v.dedup();
-        v
+        pairs(&self.implications)
     }
     pub fn add_rule(&mut self, from: &str, to: &str) {
-        let e = self.implications.entry(from.to_string()).or_default();
-        if !e.iter().any(|x| x == to) {
-            e.push(to.to_string());
-        }
+        add(&mut self.implications, from, to);
     }
     pub fn remove_rule(&mut self, from: &str, to: &str) {
-        if let Some(e) = self.implications.get_mut(from) {
-            e.retain(|x| x != to);
-            if e.is_empty() {
-                self.implications.remove(from);
-            }
-        }
+        remove(&mut self.implications, from, to);
     }
     /// Every suggestion rule as (tag, suggested) pairs, sorted, for listing.
     pub fn suggestion_rules(&self) -> Vec<(String, String)> {
-        let mut v: Vec<(String, String)> = self
-            .suggestions
-            .iter()
-            .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
-            .collect();
-        v.sort();
-        v.dedup();
-        v
+        pairs(&self.suggestions)
     }
     pub fn suggests_directly(&self, from: &str, to: &str) -> bool {
         self.suggestions
@@ -259,18 +230,10 @@ impl Vocab {
             .is_some_and(|v| v.iter().any(|x| x == to))
     }
     pub fn add_suggestion(&mut self, from: &str, to: &str) {
-        let e = self.suggestions.entry(from.to_string()).or_default();
-        if !e.iter().any(|x| x == to) {
-            e.push(to.to_string());
-        }
+        add(&mut self.suggestions, from, to);
     }
     pub fn remove_suggestion(&mut self, from: &str, to: &str) {
-        if let Some(e) = self.suggestions.get_mut(from) {
-            e.retain(|x| x != to);
-            if e.is_empty() {
-                self.suggestions.remove(from);
-            }
-        }
+        remove(&mut self.suggestions, from, to);
     }
     /// What kind of tag this is. The table first; then the prefixes that already say it: `artist:` is an artist,
     /// `oc:` a character, and a denial (`not:x`) belongs with x, so it sits in x's row.
@@ -453,48 +416,23 @@ impl Vocab {
                     if t == to {
                         r.not_carried.push(t);
                     } else {
-                        self.implications.entry(to.to_string()).or_default().push(t);
+                        add(&mut self.implications, to, &t);
                     }
                 }
             }
         }
-        for (key, list) in self.implications.iter_mut() {
-            let before = list.len();
-            let had_old = list.iter().any(|x| x == from);
-            for t in list.iter_mut() {
-                if t == from {
-                    *t = to.to_string();
-                }
-            }
-            let mut seen = BTreeSet::new();
-            list.retain(|t| t != key && seen.insert(t.clone()));
-            r.changed |= had_old || list.len() != before;
-        }
-        self.implications.retain(|_, list| !list.is_empty());
+        r.changed |= rename_targets(&mut self.implications, from, to);
         // Suggestions follow the rename too, keys and targets; nothing is derived from them, so there is no
         // cycle to guard against, only "A suggests A" to drop.
         if let Some(list) = self.suggestions.remove(from) {
             r.changed = true;
-            let e = self.suggestions.entry(to.to_string()).or_default();
             for t in list {
-                if t != to && !e.contains(&t) {
-                    e.push(t);
+                if t != to {
+                    add(&mut self.suggestions, to, &t);
                 }
             }
         }
-        for (key, list) in self.suggestions.iter_mut() {
-            let before = list.len();
-            let had_old = list.iter().any(|x| x == from);
-            for t in list.iter_mut() {
-                if t == from {
-                    *t = to.to_string();
-                }
-            }
-            let mut seen = BTreeSet::new();
-            list.retain(|t| t != key && seen.insert(t.clone()));
-            r.changed |= had_old || list.len() != before;
-        }
-        self.suggestions.retain(|_, list| !list.is_empty());
+        r.changed |= rename_targets(&mut self.suggestions, from, to);
         // the category travels with the name; a merge onto a tag with a category of its own keeps that one
         if let Some(c) = self.categories.remove(from) {
             r.changed = true;
@@ -508,6 +446,53 @@ impl Vocab {
         }
         r
     }
+}
+
+/// The two rule tables (implications, suggestions) are one shape: a tag's sorted-on-save list of targets.
+/// Every (key, target) pair, sorted and deduplicated, for listing and the sync diff.
+fn pairs(m: &HashMap<String, Vec<String>>) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = m
+        .iter()
+        .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+/// Add `to` under `from` unless it is there already.
+fn add(m: &mut HashMap<String, Vec<String>>, from: &str, to: &str) {
+    let e = m.entry(from.to_string()).or_default();
+    if !e.iter().any(|x| x == to) {
+        e.push(to.to_string());
+    }
+}
+/// Take `to` out from under `from`; an emptied key goes with it.
+fn remove(m: &mut HashMap<String, Vec<String>>, from: &str, to: &str) {
+    if let Some(e) = m.get_mut(from) {
+        e.retain(|x| x != to);
+        if e.is_empty() {
+            m.remove(from);
+        }
+    }
+}
+/// Every target `from` becomes `to`; a list then saying "A ⇒ A" or naming a target twice is tidied, and an
+/// emptied key goes. Returns whether anything changed.
+fn rename_targets(m: &mut HashMap<String, Vec<String>>, from: &str, to: &str) -> bool {
+    let mut changed = false;
+    for (key, list) in m.iter_mut() {
+        let before = list.len();
+        let had_old = list.iter().any(|x| x == from);
+        for t in list.iter_mut() {
+            if t == from {
+                *t = to.to_string();
+            }
+        }
+        let mut seen = BTreeSet::new();
+        list.retain(|t| t != key && seen.insert(t.clone()));
+        changed |= had_old || list.len() != before;
+    }
+    m.retain(|_, list| !list.is_empty());
+    changed
 }
 
 /// The namespace of a denied suggestion.
@@ -824,6 +809,29 @@ mod tests {
         );
         assert_eq!(r.not_carried, vec!["x", "b"]);
         assert_eq!(v.implications["c"], vec!["b"]); // deduplicated
+    }
+    #[test]
+    fn rename_drops_a_rule_that_now_points_at_itself_and_a_duplicated_target() {
+        // "x ⇒ a" with a renamed to x would read "x ⇒ x": gone, and x has no rules left.
+        // "y ⇒ a, x" becomes "y ⇒ x, x": one x.
+        let mut v = Vocab::default();
+        v.add_rule("x", "a");
+        v.add_rule("y", "a");
+        v.add_rule("y", "x");
+        v.add_suggestion("s", "a");
+        v.add_suggestion("s", "x");
+        let r = v.rename("a", "x");
+        assert!(r.changed);
+        assert!(
+            r.not_carried.is_empty(),
+            "a had no rules of its own to carry"
+        );
+        assert_eq!(v.rules(), vec![("y".to_string(), "x".to_string())]);
+        assert_eq!(
+            v.suggestion_rules(),
+            vec![("s".to_string(), "x".to_string())]
+        );
+        assert!(!v.implications.contains_key("x"), "an emptied key goes");
     }
     #[test]
     fn rename_never_carries_a_rule_that_would_loop() {

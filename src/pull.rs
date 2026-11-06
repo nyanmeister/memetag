@@ -16,8 +16,8 @@ use crate::vocabsync::Canonical; // `store.name()` in vocab_step is a trait meth
 use crate::Cfg;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Component, Path, PathBuf};
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::UNIX_EPOCH;
 
@@ -62,11 +62,7 @@ fn list_selected(root: &Path, scope: &crate::library::Scope) -> Result<Vec<Entry
     // An entry that cannot be read is not absent. Swallowing it here would report the file as gone and the
     // desktop would drop its row, OCR text and hash (review, 2026-09-22); so any read failure fails the listing.
     let (mut unreadable, mut first) = (0usize, None::<String>);
-    for r in walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
-        e.depth() == 0
-            || !e.file_type().is_dir()
-            || scope.traverse(e.path().strip_prefix(root).unwrap_or(e.path()))
-    }) {
+    for r in scope.walk(root) {
         let e = match r {
             Ok(e) => e,
             Err(err) => {
@@ -75,11 +71,6 @@ fn list_selected(root: &Path, scope: &crate::library::Scope) -> Result<Vec<Entry
                 continue;
             }
         };
-        if !e.file_type().is_file()
-            || !scope.contains(e.path().strip_prefix(root).unwrap_or(e.path()))
-        {
-            continue;
-        }
         let md = match e.metadata() {
             Ok(m) => m,
             Err(err) => {
@@ -128,41 +119,18 @@ fn handle(req: Request) -> Result<Reply, String> {
             list_selected(&root, &scope.unwrap_or_default()).map(Reply::List)
         }
         Request::Scan { root, path, vocab } => {
-            if !root.is_absolute()
-                || path.is_empty()
-                || !Path::new(&path)
-                    .components()
-                    .all(|p| matches!(p, Component::Normal(_)))
-            {
+            if !root.is_absolute() || crate::sources::relative(Path::new(&path)).is_err() {
                 return Err("Invalid pull file path".into());
             }
-            let full = root.join(&path);
-            if !full
-                .canonicalize()
-                .map_err(|e| e.to_string())?
-                .starts_with(root.canonicalize().map_err(|e| e.to_string())?)
-            {
-                return Err("File resolves outside the collection".into());
-            }
-            crate::index::scan_file(&root, &full, &vocab).map(Reply::Scan)
+            crate::paths::within(&root, Path::new(&path))?;
+            crate::index::scan_file(&root, &root.join(&path), &vocab).map(Reply::Scan)
         }
     }
 }
 
 /// Server side: one JSON request per stdin line, one JSON `Result<Reply, String>` per stdout line. EOF ends it.
 pub fn worker() -> Result<(), String> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| e.to_string())?;
-        let result = serde_json::from_str::<Request>(&line)
-            .map_err(|e| e.to_string())
-            .and_then(handle);
-        serde_json::to_writer(&mut stdout, &result).map_err(|e| e.to_string())?;
-        writeln!(stdout).map_err(|e| e.to_string())?;
-        stdout.flush().map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    crate::remote::serve_lines(handle)
 }
 
 /// The `[pull_remote]` host, for the vocab sync's own side-channel ssh (a plain `ssh host cat`, not the worker
@@ -224,22 +192,11 @@ impl Source {
         let (Some(input), Some(output)) = (&mut self.input, &mut self.output) else {
             return handle(req);
         };
-        // any write/read failure here is the ssh worker gone — a connect that timed out or was refused (host asleep),
-        // or a broken pipe from a helper that exited. Wait it out and name the real cause instead of blaming the helper.
-        let line = (|| -> Result<Option<String>, String> {
-            serde_json::to_writer(&mut *input, &req).map_err(|e| e.to_string())?;
-            writeln!(input).map_err(|e| e.to_string())?;
-            input.flush().map_err(|e| e.to_string())?;
-            let mut line = String::new();
-            if output.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-                return Ok(None);
-            }
-            Ok(Some(line))
-        })();
-        match line {
-            Ok(Some(line)) => serde_json::from_str::<Result<Reply, String>>(&line)
-                .map_err(|e| format!("Pull worker response: {e}"))?,
-            _ => {
+        // no answer is the ssh worker gone — a connect that timed out or was refused (host asleep), or a broken
+        // pipe from a helper that exited. Wait it out and name the real cause instead of blaming the helper.
+        match crate::remote::exchange(input, output, &req, "Pull worker")? {
+            Some(reply) => reply,
+            None => {
                 let status = self.child.as_mut().and_then(|c| c.wait().ok());
                 Err(worker_down(
                     self.host.as_deref().unwrap_or("the server"),
@@ -742,7 +699,7 @@ fn sync(
                 continue;
             }
             let (old, new) = (&olds[0], &news[0]);
-            for t in ["text", "text_meta", "manual_text", "phash2"] {
+            for t in crate::index::CARRIED {
                 let has: i64 = tx
                     .query_row(
                         &format!("SELECT count(*) FROM {t} WHERE path=?1"),
@@ -758,18 +715,7 @@ fn sync(
             moved += 1;
         }
         for g in &p.gone {
-            for t in [
-                "tags",
-                "files",
-                "text",
-                "phash2",
-                "manual_text",
-                "text_meta",
-                "proposal_rejects",
-            ] {
-                tx.execute(&format!("DELETE FROM {t} WHERE path=?1"), [g])
-                    .map_err(|e| e.to_string())?;
-            }
+            db.forget(g)?;
             crate::grab::forget(c, g);
         }
         tx.commit().map_err(|e| e.to_string())?;

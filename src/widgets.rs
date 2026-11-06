@@ -15,6 +15,7 @@
 //!   field), Escape clears the field. A click on a suggestion takes it too.
 //! - **Colours mean one thing each,** below. Anything else uses the theme's own visuals.
 use crate::autocomplete;
+use crate::index::FileRow;
 use eframe::egui;
 use std::collections::BTreeSet;
 
@@ -493,6 +494,196 @@ impl TagInput {
     }
 }
 
+/// "1 file", "3 files".
+pub fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+/// A tile's texture as the cards draw it: the id, the size of one frame, and how many frames sit side by side in
+/// it (a storyboard strip; a still has one).
+pub type Texture = (egui::TextureId, egui::Vec2, u32);
+/// The side of a card's tile; the grid's own tiles are larger.
+pub const CARD_TILE: f32 = 150.0;
+/// What a tile's caption says of its hand-written tags.
+pub fn tags_label(row: &FileRow) -> String {
+    if row.xmp_tag_count == 0 {
+        "no tags".to_string()
+    } else {
+        format!("{} tags", row.xmp_tag_count)
+    }
+}
+/// A tile's hover text: path, dimensions, format, tag count, then the tags themselves.
+pub fn hover_text(row: &FileRow) -> String {
+    format!(
+        "{}\n{} × {} · {} · {}\n{}",
+        row.path,
+        row.width,
+        row.height,
+        row.format,
+        tags_label(row),
+        if row.tags.is_empty() {
+            "No tags yet".to_string()
+        } else {
+            row.tags
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" · ")
+        }
+    )
+}
+/// One card tile: the picture (the first frame of a strip), an outline when asked or when hovered, and two small
+/// lines under it, `top_line` then the file's folder.
+pub fn tile(
+    ui: &mut egui::Ui,
+    row: &FileRow,
+    texture: Option<&Texture>,
+    top_line: &str,
+    stroke: Option<egui::Stroke>,
+) -> egui::Response {
+    let (cell, resp) = ui.allocate_exact_size(
+        egui::vec2(CARD_TILE, CARD_TILE + 34.0),
+        egui::Sense::click(),
+    );
+    let pic = egui::Rect::from_min_size(cell.min, egui::vec2(CARD_TILE, CARD_TILE));
+    ui.painter()
+        .rect_filled(pic, 4.0, ui.visuals().widgets.inactive.bg_fill);
+    if let Some((tid, size, frames)) = texture {
+        let scale = (CARD_TILE / size.x).min(CARD_TILE / size.y).min(4.0);
+        let draw = egui::Rect::from_center_size(pic.center(), *size * scale);
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1.0 / (*frames).max(1) as f32, 1.0),
+        );
+        egui::Image::from_texture(egui::load::SizedTexture::new(*tid, draw.size()))
+            .uv(uv)
+            .paint_at(ui, draw);
+    }
+    let stroke = stroke.or_else(|| {
+        resp.hovered()
+            .then(|| ui.visuals().widgets.hovered.fg_stroke)
+    });
+    if let Some(s) = stroke {
+        ui.painter()
+            .rect_stroke(pic, 4.0, s, egui::StrokeKind::Inside);
+    }
+    let folder = row
+        .path
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or("(root)");
+    let font = egui::FontId::proportional(11.0);
+    let color = ui.visuals().weak_text_color();
+    ui.painter().text(
+        pic.left_bottom() + egui::vec2(2.0, 4.0),
+        egui::Align2::LEFT_TOP,
+        top_line,
+        font.clone(),
+        color,
+    );
+    ui.painter().text(
+        pic.left_bottom() + egui::vec2(2.0, 18.0),
+        egui::Align2::LEFT_TOP,
+        folder.chars().take(24).collect::<String>(),
+        font,
+        color,
+    );
+    resp
+}
+/// The `◀ a–b of N ▶` pager over `len` items in pages of `per`, drawn only when there is more than one page;
+/// `page` is kept in range. `what` goes before the count ("groups ").
+pub fn pager(ui: &mut egui::Ui, page: &mut usize, len: usize, per: usize, what: &str) {
+    let pages = len.div_ceil(per).max(1);
+    *page = (*page).min(pages - 1);
+    if pages <= 1 {
+        return;
+    }
+    if ui.add_enabled(*page > 0, egui::Button::new("◀")).clicked() {
+        *page -= 1;
+    }
+    ui.label(format!(
+        "{what}{}–{} of {}",
+        *page * per + 1,
+        ((*page + 1) * per).min(len),
+        len
+    ));
+    if ui
+        .add_enabled(*page + 1 < pages, egui::Button::new("▶"))
+        .clicked()
+    {
+        *page += 1;
+    }
+}
+
+/// A floating card over the grid: a window that never collapses, resizes within the grid's window (a margin kept
+/// all round), opens at `size` or what fits, and closes by its × (`open` turns false). `scroll` gives the whole
+/// body the vertical scroll bar; the list cards scroll a region of their own instead.
+pub fn card(
+    ctx: &egui::Context,
+    title: &str,
+    size: [f32; 2],
+    scroll: bool,
+    open: &mut bool,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let max = ctx.content_rect().size() - egui::vec2(40.0, 60.0);
+    egui::Window::new(title)
+        .open(open)
+        .collapsible(false)
+        .resizable(true)
+        .vscroll(scroll)
+        .default_size(egui::Vec2::from(size).min(max))
+        .max_size(max)
+        .show(ctx, body);
+}
+
+/// A result still being made on a thread: the loads and saves the cards start. `spawn` runs the work and wakes the
+/// window when it is done; `poll` hands the answer over once, and keeps the window looking every 50 ms meanwhile,
+/// so a wake-up that was lost costs nothing visible. A thread that went away without answering is `died`.
+pub struct Pending<T>(Option<std::sync::mpsc::Receiver<Result<T, String>>>);
+impl<T> Default for Pending<T> {
+    fn default() -> Self {
+        Pending(None)
+    }
+}
+impl<T> Pending<T> {
+    pub fn spawn(
+        ctx: &egui::Context,
+        work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Self
+    where
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+            ctx.request_repaint();
+        });
+        Pending(Some(rx))
+    }
+    /// Still waiting for the answer.
+    pub fn busy(&self) -> bool {
+        self.0.is_some()
+    }
+    pub fn poll(&mut self, ctx: &egui::Context, died: &str) -> Option<Result<T, String>> {
+        use std::sync::mpsc::TryRecvError::*;
+        let got = match self.0.as_ref()?.try_recv() {
+            Ok(r) => r,
+            Err(Disconnected) => Err(died.to_string()),
+            Err(Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                return None;
+            }
+        };
+        self.0 = None;
+        Some(got)
+    }
+}
+
 /// The one reader of Escape. Consumes every plain Escape press of this frame and says whether any was a real press
 /// rather than a key repeat. Autorepeat outruns the cards (especially with fast repeat settings), so a
 /// held Escape used to close the editor with the first repeat and the whole window with the second (2026-09-22).
@@ -701,6 +892,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_pending_answer_arrives_once_and_a_dead_thread_is_named() {
+        // Expected by hand: the answer comes through exactly once and the slot is free afterwards; a sender
+        // dropped without an answer (the thread died) reads as the named error, once; work still running
+        // yields nothing and leaves the slot busy.
+        let ctx = egui::Context::default();
+        let mut p: Pending<u32> = Pending::spawn(&ctx, || Ok(7));
+        let got = loop {
+            if let Some(r) = p.poll(&ctx, "work stopped") {
+                break r;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(got, Ok(7));
+        assert!(!p.busy());
+        assert!(
+            p.poll(&ctx, "work stopped").is_none(),
+            "an answer is handed over once"
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+        drop(tx);
+        let mut p = Pending(Some(rx));
+        assert_eq!(
+            p.poll(&ctx, "work stopped"),
+            Some(Err("work stopped".into()))
+        );
+        assert!(!p.busy());
+        assert!(
+            p.poll(&ctx, "work stopped").is_none(),
+            "and the death is reported once"
+        );
+        let (_tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+        let mut p = Pending(Some(rx));
+        assert!(p.poll(&ctx, "work stopped").is_none());
+        assert!(p.busy(), "still working");
+    }
     #[test]
     fn escape_counts_presses_not_repeats() {
         let none = egui::Modifiers::NONE;
